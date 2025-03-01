@@ -1,0 +1,148 @@
+#!/bin/sh
+
+# IFLV - 更新EPG
+# 用于手动或定时更新EPG数据
+
+# 获取配置信息
+. /lib/functions.sh
+
+# 加载配置
+config_load iflv
+
+# 获取EPG设置
+config_get PRIMARY_SOURCE epg primary_source
+config_get AUTO_MATCH epg auto_match "1"
+
+# 获取系统设置
+config_get LOG_LEVEL system log_level "info"
+
+# 日志函数
+log() {
+    local level="$1"
+    local message="$2"
+    
+    case "$LOG_LEVEL" in
+        debug)
+            [ "$level" = "debug" -o "$level" = "info" -o "$level" = "warn" -o "$level" = "error" ] && echo "$(date '+%Y-%m-%d %H:%M:%S') [$level] $message" >> /var/log/iflv.log
+            ;;
+        info)
+            [ "$level" = "info" -o "$level" = "warn" -o "$level" = "error" ] && echo "$(date '+%Y-%m-%d %H:%M:%S') [$level] $message" >> /var/log/iflv.log
+            ;;
+        warn)
+            [ "$level" = "warn" -o "$level" = "error" ] && echo "$(date '+%Y-%m-%d %H:%M:%S') [$level] $message" >> /var/log/iflv.log
+            ;;
+        error)
+            [ "$level" = "error" ] && echo "$(date '+%Y-%m-%d %H:%M:%S') [$level] $message" >> /var/log/iflv.log
+            ;;
+    esac
+}
+
+# 确保目录存在
+mkdir -p /usr/share/iflv
+
+# 记录日志
+log "info" "开始更新EPG，主要来源：$PRIMARY_SOURCE"
+
+# 处理不同的EPG来源
+case "$PRIMARY_SOURCE" in
+    default)
+        EPG_URL="https://epg.112114.xyz/pp.xml"
+        ;;
+    epg1)
+        EPG_URL="https://epg.112114.xyz/pp.xml"
+        ;;
+    epg2)
+        EPG_URL="http://epg.51zmt.top:8000/e.xml"
+        ;;
+    epg3)
+        EPG_URL="https://epg.pm/xml/e.xml"
+        ;;
+    epg4)
+        EPG_URL="http://epg.it999.ru/epg.xml.gz"
+        ;;
+    epg5)
+        EPG_URL="https://cdn.jsdelivr.net/gh/Guovin/iptv-api@latest/epg.xml"
+        ;;
+    epg6)
+        EPG_URL="https://node.iptv-org.github.io/epg/guides/cn.xml"
+        ;;
+    *)
+        # 检查用户自定义的EPG源
+        config_foreach get_custom_epg epg_source
+        ;;
+esac
+
+# 获取自定义EPG源
+get_custom_epg() {
+    local section="$1"
+    local name
+    local url
+    local enabled
+    
+    config_get name "$section" name
+    config_get url "$section" url
+    config_get_bool enabled "$section" enabled 1
+    
+    if [ "$name" = "$PRIMARY_SOURCE" ] && [ "$enabled" = "1" ] && [ -n "$url" ]; then
+        EPG_URL="$url"
+    fi
+}
+
+# 如果没有找到有效的EPG URL，使用默认值
+if [ -z "$EPG_URL" ]; then
+    log "warn" "未找到有效的EPG来源，使用默认来源"
+    EPG_URL="https://epg.112114.xyz/pp.xml"
+fi
+
+# 下载EPG数据
+log "info" "从 $EPG_URL 下载EPG数据"
+TMP_FILE="/tmp/iflv_epg_tmp.xml"
+
+# 使用wget下载
+wget -q --timeout=30 -O "$TMP_FILE" "$EPG_URL"
+if [ $? -ne 0 ]; then
+    log "error" "下载EPG数据失败"
+    rm -f "$TMP_FILE"
+    exit 1
+fi
+
+# 检查文件大小
+FILE_SIZE=$(ls -l "$TMP_FILE" | awk '{print $5}')
+if [ "$FILE_SIZE" -lt 1000 ]; then
+    log "error" "下载的EPG数据太小，可能无效"
+    rm -f "$TMP_FILE"
+    exit 1
+fi
+
+# 处理可能的gzip压缩文件
+if file "$TMP_FILE" | grep -q "gzip"; then
+    log "info" "检测到gzip压缩文件，正在解压"
+    mv "$TMP_FILE" "$TMP_FILE.gz"
+    gzip -d "$TMP_FILE.gz"
+    if [ $? -ne 0 ]; then
+        log "error" "解压EPG数据失败"
+        rm -f "$TMP_FILE.gz"
+        exit 1
+    fi
+fi
+
+# 移动到最终位置
+mv "$TMP_FILE" /usr/share/iflv/epg.xml
+log "info" "EPG数据已更新到 /usr/share/iflv/epg.xml"
+
+# 如果启用了自动匹配，则执行频道匹配
+if [ "$AUTO_MATCH" = "1" ]; then
+    log "info" "开始自动匹配频道"
+    /usr/bin/iflv match_epg
+    if [ $? -ne 0 ]; then
+        log "error" "自动匹配频道失败"
+    else
+        log "info" "自动匹配频道完成"
+    fi
+fi
+
+# 通知UI更新
+/etc/init.d/iflv reload
+
+log "info" "EPG更新完成"
+exit 0 

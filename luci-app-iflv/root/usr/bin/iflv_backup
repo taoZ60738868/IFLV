@@ -1,0 +1,144 @@
+#!/bin/sh
+
+# IFLV - 备份还原工具
+# 用于备份和还原IFLV的配置和数据
+
+ACTION="$1"
+BACKUP_FILE="$2"
+BACKUP_DIR="/tmp"
+CONFIG_DIR="/etc/config"
+DATA_DIR="/usr/share/iflv"
+DEFAULT_BACKUP_FILE="iflv_backup_$(date +%Y%m%d_%H%M%S).tar.gz"
+
+# 日志函数
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $1" >> /var/log/iflv.log
+}
+
+# 创建备份
+create_backup() {
+    # 确保目录存在
+    mkdir -p "$BACKUP_DIR"
+    
+    # 确保数据目录存在
+    if [ ! -d "$DATA_DIR" ]; then
+        log "[error] 数据目录不存在: $DATA_DIR"
+        exit 1
+    fi
+    
+    # 如果未指定备份文件名，使用默认名称
+    if [ -z "$BACKUP_FILE" ]; then
+        BACKUP_FILE="$BACKUP_DIR/$DEFAULT_BACKUP_FILE"
+    else
+        # 如果提供的是目录，则在该目录下使用默认文件名
+        if [ -d "$BACKUP_FILE" ]; then
+            BACKUP_FILE="$BACKUP_FILE/$DEFAULT_BACKUP_FILE"
+        fi
+    fi
+    
+    log "[info] 创建备份: $BACKUP_FILE"
+    
+    # 创建临时目录
+    TMP_DIR=$(mktemp -d)
+    
+    # 复制配置文件
+    cp "$CONFIG_DIR/iflv" "$TMP_DIR/" 2>/dev/null
+    
+    # 复制数据文件
+    mkdir -p "$TMP_DIR/data"
+    cp -r "$DATA_DIR/"* "$TMP_DIR/data/" 2>/dev/null
+    
+    # 创建备份版本信息文件
+    echo "IFLV Backup" > "$TMP_DIR/backup_info"
+    echo "Version: 1.0.0" >> "$TMP_DIR/backup_info"
+    echo "Date: $(date)" >> "$TMP_DIR/backup_info"
+    
+    # 创建tar归档
+    tar -czf "$BACKUP_FILE" -C "$TMP_DIR" .
+    
+    # 清理临时目录
+    rm -rf "$TMP_DIR"
+    
+    # 检查备份是否成功
+    if [ $? -eq 0 ] && [ -f "$BACKUP_FILE" ]; then
+        log "[info] 备份创建成功: $BACKUP_FILE"
+        echo "$BACKUP_FILE"
+        exit 0
+    else
+        log "[error] 备份创建失败"
+        exit 1
+    fi
+}
+
+# 还原备份
+restore_backup() {
+    # 检查备份文件
+    if [ -z "$BACKUP_FILE" ] || [ ! -f "$BACKUP_FILE" ]; then
+        log "[error] 备份文件不存在或无效: $BACKUP_FILE"
+        exit 1
+    fi
+    
+    log "[info] 开始从 $BACKUP_FILE 还原备份"
+    
+    # 创建临时目录
+    TMP_DIR=$(mktemp -d)
+    
+    # 解压备份文件
+    tar -xzf "$BACKUP_FILE" -C "$TMP_DIR"
+    
+    # 检查解压是否成功
+    if [ $? -ne 0 ]; then
+        log "[error] 解压备份文件失败"
+        rm -rf "$TMP_DIR"
+        exit 1
+    fi
+    
+    # 检查备份版本信息
+    if [ ! -f "$TMP_DIR/backup_info" ]; then
+        log "[warn] 备份文件中没有版本信息，可能不是有效的IFLV备份"
+    fi
+    
+    # 还原配置文件
+    if [ -f "$TMP_DIR/iflv" ]; then
+        cp "$TMP_DIR/iflv" "$CONFIG_DIR/" 2>/dev/null
+        log "[info] 配置文件已还原"
+    else
+        log "[warn] 备份中没有找到配置文件"
+    fi
+    
+    # 还原数据文件
+    if [ -d "$TMP_DIR/data" ]; then
+        mkdir -p "$DATA_DIR"
+        cp -r "$TMP_DIR/data/"* "$DATA_DIR/" 2>/dev/null
+        log "[info] 数据文件已还原"
+    else
+        log "[warn] 备份中没有找到数据文件"
+    fi
+    
+    # 清理临时目录
+    rm -rf "$TMP_DIR"
+    
+    log "[info] 备份还原完成"
+    
+    # 重启服务
+    log "[info] 正在重启IFLV服务..."
+    /etc/init.d/iflv restart
+    
+    exit 0
+}
+
+# 主程序
+case "$ACTION" in
+    create)
+        create_backup
+        ;;
+    restore)
+        restore_backup
+        ;;
+    *)
+        echo "用法: $0 {create|restore} [文件路径]"
+        echo "  create  - 创建备份"
+        echo "  restore - 从指定文件还原备份"
+        exit 1
+        ;;
+esac 

@@ -1,0 +1,130 @@
+#!/bin/sh
+
+# IFLV - uci-defaults 安装脚本
+# 用于iStore和OpenWRT安装后的初始化
+
+# 添加ACL权限
+if [ -f "/usr/share/rpcd/acl.d/luci-app-iflv.json" ]; then
+    echo '访问控制配置已存在'
+else
+    echo '创建访问控制配置'
+    cat > /usr/share/rpcd/acl.d/luci-app-iflv.json << EOF
+{
+    "luci-app-iflv": {
+        "description": "Grant access to IFLV",
+        "read": {
+            "ubus": {
+                "service": [ "list" ],
+                "iflv.channels": [ "status", "export", "import", "test" ],
+                "iflv.proxy": [ "status" ],
+                "iflv.system": [ "info" ],
+                "iflv.log": [ "read", "clear", "diagnostics" ],
+                "file": [ "read", "write", "list" ]
+            },
+            "uci": [ "iflv" ],
+            "file": {
+                "/var/log/iflv.log": [ "read" ],
+                "/tmp/iflv_*": [ "read" ],
+                "/usr/share/iflv/*": [ "read" ],
+                "/usr/bin/iflv*": [ "exec" ],
+                "/etc/init.d/iflv": [ "exec" ]
+            }
+        },
+        "write": {
+            "uci": [ "iflv" ],
+            "file": {
+                "/usr/share/iflv/custom_parser.js": [ "write" ],
+                "/usr/share/iflv/channels.json": [ "write" ],
+                "/tmp/iflv_*": [ "write" ]
+            }
+        }
+    }
+}
+EOF
+fi
+
+# 创建默认配置文件
+if [ -f "/etc/config/iflv" ]; then
+    echo '配置文件已存在'
+else
+    echo '创建默认配置文件'
+    cat > /etc/config/iflv << EOF
+config globals 'globals'
+	option enabled '0'
+	option work_mode 'dual_line'
+	option iptv_provider 'china_telecom'
+	option iptv_region 'shanghai'
+	option platform 'openwrt'
+	
+config interface 'interface'
+	option modem_port ''
+	option stb_port ''
+	option vlan_id ''
+	option inner_vlan_id ''
+	
+config epg 'epg'
+	option update_interval '12'
+	option primary_source 'default'
+	option auto_match '1'
+
+config system 'system'
+	option log_level 'info'
+	option auto_start '1'
+	option auto_analyze '1'
+	
+config download 'download'
+	option enabled '1'
+	option port '8899'
+	option https_enabled '0'
+	option https_port '8443'
+	option auth_required '0'
+	option username 'admin'
+	option password 'iflv123'
+
+config client 'client'
+	option auto_update '1'
+	option update_interval '24'
+	option auto_start '1'
+	option android_version '0.2.0'
+	option windows_version '0.2.0'
+	option mac_version '0.2.0'
+	option ios_version '0.2.0'
+EOF
+fi
+
+# 创建必要的目录
+mkdir -p /usr/share/iflv
+mkdir -p /usr/share/iflv/assets
+mkdir -p /usr/share/iflv/downloads
+
+# 设置权限
+chmod +x /usr/bin/iflv*
+chmod +x /etc/init.d/iflv
+
+# 检测平台类型
+/usr/bin/iflv check_platform
+
+# 设置防火墙规则（如果需要）
+if grep -q "iflv" /etc/firewall.user; then
+    echo '防火墙规则已存在'
+else
+    echo '添加防火墙规则'
+    cat >> /etc/firewall.user << EOF
+# IFLV - 允许客户端下载端口
+iptables -A INPUT -p tcp --dport 8899 -j ACCEPT
+EOF
+fi
+
+# 自动检测是否为iStore环境
+if [ -d "/tmp/istore" ] || [ -f "/etc/istore.info" ]; then
+    echo '检测到iStore环境，进行特殊配置'
+    # iStore特定配置可以在这里添加
+fi
+
+# 启用服务自启动
+/etc/init.d/iflv enable
+
+# 重启ubusd使ACL生效
+/etc/init.d/rpcd restart
+
+exit 0 

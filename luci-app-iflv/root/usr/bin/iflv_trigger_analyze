@@ -1,0 +1,73 @@
+#!/bin/sh
+
+# IFLV - 触发抓包分析
+# 用于手动触发抓包分析流程
+
+# 在开始前，先终止可能正在运行的抓包进程
+pkill -f "tcpdump.*iflv_capture.pcap" 2>/dev/null
+
+# 获取配置信息
+. /lib/functions.sh
+. /lib/functions/network.sh
+
+# 加载配置
+config_load iflv
+
+# 获取工作模式
+config_get WORK_MODE globals work_mode
+
+# 获取网口信息
+config_get MODEM_PORT interface modem_port
+config_get WAN_INTERFACE interface wan_interface
+config_get STB_PORT interface stb_port
+
+# 确定要监听的端口
+CAPTURE_PORT="$MODEM_PORT"
+if [ "$WORK_MODE" = "vlan" ] || [ "$WORK_MODE" = "vlan_passthrough" ]; then
+    # 如果是VLAN模式，获取WAN的物理接口
+    network_get_device CAPTURE_PORT "$WAN_INTERFACE"
+fi
+
+if [ -z "$CAPTURE_PORT" ]; then
+    echo "[error] 未配置有效的抓包网口" >> /var/log/iflv.log
+    exit 1
+fi
+
+# 记录日志
+echo "$(date '+%Y-%m-%d %H:%M:%S') [info] 开始在端口 $CAPTURE_PORT 上手动抓包分析..." >> /var/log/iflv.log
+
+# 开始抓包，在后台运行
+tcpdump -i "$CAPTURE_PORT" -n -v udp -s 0 -w /tmp/iflv_capture.pcap -c 1000 &
+TCPDUMP_PID=$!
+
+# 记录日志
+echo "$(date '+%Y-%m-%d %H:%M:%S') [debug] tcpdump进程ID: $TCPDUMP_PID" >> /var/log/iflv.log
+
+# 设置最大抓包时间为5分钟
+(
+    sleep 300
+    if kill -0 $TCPDUMP_PID 2>/dev/null; then
+        kill $TCPDUMP_PID
+        echo "$(date '+%Y-%m-%d %H:%M:%S') [info] 抓包超时，已终止" >> /var/log/iflv.log
+    fi
+) &
+TIMER_PID=$!
+
+# 等待抓包完成
+wait $TCPDUMP_PID
+
+# 取消定时器
+kill $TIMER_PID 2>/dev/null
+
+# 抓包完成，开始分析
+echo "$(date '+%Y-%m-%d %H:%M:%S') [info] 抓包完成，开始分析数据包..." >> /var/log/iflv.log
+
+# 调用主程序进行分析
+/usr/bin/iflv analyze /tmp/iflv_capture.pcap
+
+# 分析完成，清理临时文件
+rm -f /tmp/iflv_capture.pcap
+
+echo "$(date '+%Y-%m-%d %H:%M:%S') [info] 数据包分析完成" >> /var/log/iflv.log
+
+exit 0 

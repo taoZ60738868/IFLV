@@ -1,0 +1,643 @@
+#!/bin/sh
+
+# IFLV - IPTV转发系统
+# 版本: 0.2.0
+
+# 日志函数
+log() {
+    local level="$1"
+    local message="$2"
+    local log_level="$LOG_LEVEL"
+    
+    # 默认日志级别为info
+    [ -z "$log_level" ] && log_level="info"
+    
+    case "$log_level" in
+        debug)
+            [ "$level" = "debug" -o "$level" = "info" -o "$level" = "warn" -o "$level" = "error" ] && echo "$(date '+%Y-%m-%d %H:%M:%S') [$level] $message" >> /var/log/iflv.log
+            ;;
+        info)
+            [ "$level" = "info" -o "$level" = "warn" -o "$level" = "error" ] && echo "$(date '+%Y-%m-%d %H:%M:%S') [$level] $message" >> /var/log/iflv.log
+            ;;
+        warn)
+            [ "$level" = "warn" -o "$level" = "error" ] && echo "$(date '+%Y-%m-%d %H:%M:%S') [$level] $message" >> /var/log/iflv.log
+            ;;
+        error)
+            [ "$level" = "error" ] && echo "$(date '+%Y-%m-%d %H:%M:%S') [$level] $message" >> /var/log/iflv.log
+            ;;
+    esac
+}
+
+# 指令分发
+dispatch_command() {
+    local command="$1"
+    shift
+    
+    case "$command" in
+        "analyze")
+            analyze_packets "$@"
+            ;;
+        "match_epg")
+            match_epg "$@"
+            ;;
+        "start_download")
+            start_download_server "$@"
+            ;;
+        "stop_download")
+            stop_download_server "$@"
+            ;;
+        "check_platform")
+            check_platform
+            ;;
+        "generate_clients")
+            generate_client_packages
+            ;;
+        "update_clients")
+            update_client_versions
+            ;;
+        *)
+            # 如果没有特定命令，则启动主程序
+            main "$@"
+            ;;
+    esac
+}
+
+# 解析参数
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --work-mode)
+            WORK_MODE="$2"
+            shift 2
+            ;;
+        --modem-port)
+            MODEM_PORT="$2"
+            shift 2
+            ;;
+        --stb-port)
+            STB_PORT="$2"
+            shift 2
+            ;;
+        --vlan-id)
+            VLAN_ID="$2"
+            shift 2
+            ;;
+        --inner-vlan-id)
+            INNER_VLAN_ID="$2"
+            shift 2
+            ;;
+        --provider)
+            PROVIDER="$2"
+            shift 2
+            ;;
+        --region)
+            REGION="$2"
+            shift 2
+            ;;
+        --log-level)
+            LOG_LEVEL="$2"
+            shift 2
+            ;;
+        --auto-analyze)
+            AUTO_ANALYZE="1"
+            shift
+            ;;
+        --platform)
+            PLATFORM="$2"
+            shift 2
+            ;;
+        analyze|match_epg|start_download|stop_download|check_platform|generate_clients|update_clients)
+            dispatch_command "$@"
+            exit $?
+            ;;
+        *)
+            log "error" "未知参数: $1"
+            exit 1
+            ;;
+    esac
+done
+
+# 检查系统平台并进行适配
+check_platform() {
+    # 获取配置的平台设置
+    . /lib/functions.sh
+    config_load iflv
+    config_get PLATFORM globals platform "openwrt"
+    
+    # 检测实际运行平台
+    DETECTED_PLATFORM="openwrt"
+    
+    # 检查是否在Docker环境中
+    if [ -f /.dockerenv ] || grep -q 'docker\|lxc' /proc/1/cgroup 2>/dev/null; then
+        DETECTED_PLATFORM="docker"
+    # 检查是否是iStore环境
+    elif [ -d /tmp/istore ] || [ -f /etc/istore.info ]; then
+        DETECTED_PLATFORM="istore"
+    # 检查是否是爱快环境
+    elif grep -q 'aiquik' /etc/os-release 2>/dev/null; then
+        DETECTED_PLATFORM="aiquik"
+    # 检查是否是小米路由器
+    elif grep -q 'XiaoQiang' /etc/openwrt_release 2>/dev/null; then
+        DETECTED_PLATFORM="xiaomi"
+    # 检查是否是群晖环境
+    elif [ -f /etc/synoinfo.conf ] || [ -f /etc/VERSION ]; then
+        DETECTED_PLATFORM="synology"
+    fi
+    
+    # 如果检测到的平台与配置不同，更新配置
+    if [ "$DETECTED_PLATFORM" != "$PLATFORM" ]; then
+        log "info" "检测到平台: $DETECTED_PLATFORM, 不同于配置的平台: $PLATFORM, 更新配置"
+        uci set iflv.globals.platform="$DETECTED_PLATFORM"
+        uci commit iflv
+        PLATFORM="$DETECTED_PLATFORM"
+    fi
+    
+    # 输出平台信息
+    echo "当前平台: $PLATFORM"
+    
+    return 0
+}
+
+# 下载服务相关函数
+start_download_server() {
+    log "info" "启动下载服务..."
+    
+    # 加载配置
+    . /lib/functions.sh
+    config_load iflv
+    
+    # 获取下载服务配置
+    config_get DOWNLOAD_ENABLED download enabled "1"
+    config_get DOWNLOAD_PORT download port "8899"
+    config_get HTTPS_ENABLED download https_enabled "0"
+    config_get HTTPS_PORT download https_port "8443"
+    config_get AUTH_REQUIRED download auth_required "0"
+    config_get USERNAME download username "admin"
+    config_get PASSWORD download password "iflv123"
+    
+    # 如果未启用下载服务，则返回
+    if [ "$DOWNLOAD_ENABLED" != "1" ]; then
+        log "info" "下载服务未启用"
+        return 0
+    fi
+    
+    # 确保下载目录存在
+    mkdir -p /usr/share/iflv/downloads
+    
+    # 检查是否已存在客户端包，如果没有则生成
+    if [ ! -f "/usr/share/iflv/downloads/iflv-android.apk" ]; then
+        log "info" "客户端安装包不存在，正在生成..."
+        generate_client_packages
+    fi
+    
+    # 生成下载页面
+    generate_download_page
+    
+    # 启动uhttpd服务提供下载
+    if ! pgrep -f "uhttpd -f -p $DOWNLOAD_PORT" > /dev/null; then
+        log "info" "启动HTTP下载服务，端口: $DOWNLOAD_PORT"
+        
+        AUTH_OPTIONS=""
+        if [ "$AUTH_REQUIRED" = "1" ]; then
+            # 创建密码文件
+            echo "$USERNAME:$(echo "$PASSWORD" | md5sum | awk '{print $1}')" > /usr/share/iflv/downloads/.htpasswd
+            AUTH_OPTIONS="-A /usr/share/iflv/downloads/.htpasswd"
+        fi
+        
+        uhttpd -f -p $DOWNLOAD_PORT -h /usr/share/iflv/downloads $AUTH_OPTIONS &
+        log "info" "HTTP下载服务已启动"
+    else
+        log "info" "HTTP下载服务已经在运行"
+    fi
+    
+    # 如果启用了HTTPS，启动HTTPS服务
+    if [ "$HTTPS_ENABLED" = "1" ]; then
+        if ! pgrep -f "uhttpd -f -p $HTTPS_PORT -s" > /dev/null; then
+            # 检查证书是否存在，如果不存在则创建自签名证书
+            if [ ! -f "/usr/share/iflv/downloads/iflv.crt" ] || [ ! -f "/usr/share/iflv/downloads/iflv.key" ]; then
+                log "info" "正在生成自签名SSL证书..."
+                openssl req -x509 -newkey rsa:2048 -keyout /usr/share/iflv/downloads/iflv.key -out /usr/share/iflv/downloads/iflv.crt -days 365 -nodes -subj "/CN=IFLV Download Server"
+            fi
+            
+            log "info" "启动HTTPS下载服务，端口: $HTTPS_PORT"
+            uhttpd -f -p $HTTPS_PORT -s 0.0.0.0:$HTTPS_PORT -h /usr/share/iflv/downloads -C /usr/share/iflv/downloads/iflv.crt -K /usr/share/iflv/downloads/iflv.key $AUTH_OPTIONS &
+            log "info" "HTTPS下载服务已启动"
+        else
+            log "info" "HTTPS下载服务已经在运行"
+        fi
+    fi
+    
+    return 0
+}
+
+# 停止下载服务
+stop_download_server() {
+    log "info" "停止下载服务..."
+    
+    # 查找并停止服务进程
+    . /lib/functions.sh
+    config_load iflv
+    config_get DOWNLOAD_PORT download port "8899"
+    config_get HTTPS_PORT download https_port "8443"
+    
+    pkill -f "uhttpd -f -p $DOWNLOAD_PORT"
+    
+    if [ -n "$HTTPS_PORT" ]; then
+        pkill -f "uhttpd -f -p $HTTPS_PORT -s"
+    fi
+    
+    log "info" "下载服务已停止"
+    return 0
+}
+
+# 生成下载页面
+generate_download_page() {
+    log "info" "生成下载页面..."
+    
+    # 获取配置
+    . /lib/functions.sh
+    config_load iflv
+    
+    config_get ANDROID_VERSION client android_version "0.2.0"
+    config_get WINDOWS_VERSION client windows_version "0.2.0"
+    config_get MAC_VERSION client mac_version "0.2.0"
+    config_get IOS_VERSION client ios_version "0.2.0"
+    
+    # 创建HTML文件
+    cat > /usr/share/iflv/downloads/index.html << EOF
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IFLV (假驴子) 客户端下载</title>
+    <style>
+        body {
+            font-family: 'Helvetica Neue', Arial, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        .logo {
+            max-width: 150px;
+            margin-bottom: 15px;
+        }
+        h1 {
+            color: #2c3e50;
+            margin-bottom: 5px;
+        }
+        .subtitle {
+            color: #7f8c8d;
+            font-size: 1.2em;
+            margin-bottom: 30px;
+        }
+        .download-container {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: center;
+            gap: 20px;
+            margin-bottom: 40px;
+        }
+        .download-item {
+            background-color: white;
+            border-radius: 8px;
+            padding: 20px;
+            width: 200px;
+            text-align: center;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            transition: transform 0.3s ease;
+        }
+        .download-item:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
+        }
+        .download-icon {
+            font-size: 48px;
+            margin-bottom: 15px;
+        }
+        .download-title {
+            font-weight: bold;
+            margin-bottom: 10px;
+            font-size: 1.2em;
+        }
+        .download-version {
+            color: #7f8c8d;
+            font-size: 0.9em;
+            margin-bottom: 15px;
+        }
+        .download-button {
+            display: inline-block;
+            background-color: #3498db;
+            color: white;
+            padding: 8px 16px;
+            border-radius: 4px;
+            text-decoration: none;
+            transition: background-color 0.3s ease;
+        }
+        .download-button:hover {
+            background-color: #2980b9;
+        }
+        .footer {
+            margin-top: 50px;
+            text-align: center;
+            color: #7f8c8d;
+            font-size: 0.9em;
+        }
+        .instructions {
+            background-color: white;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 30px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+        .instructions h2 {
+            color: #2c3e50;
+            margin-top: 0;
+        }
+        .instructions ol {
+            padding-left: 20px;
+        }
+        @media (max-width: 600px) {
+            .download-container {
+                flex-direction: column;
+                align-items: center;
+            }
+            .download-item {
+                width: 80%;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <img src="logo.png" alt="IFLV Logo" class="logo">
+        <h1>IFLV (假驴子) 客户端下载</h1>
+        <div class="subtitle">让IPTV不再受限，全家共享一个账号</div>
+    </div>
+
+    <div class="instructions">
+        <h2>使用说明</h2>
+        <ol>
+            <li>根据您的设备类型选择相应的客户端下载</li>
+            <li>安装完成后打开应用，无需额外配置，将自动连接到家庭IFLV服务</li>
+            <li>如需手动配置，请在设置中填入路由器IP地址</li>
+            <li>支持EPG节目单显示、频道收藏、节目回看等功能</li>
+        </ol>
+    </div>
+
+    <div class="download-container">
+        <div class="download-item">
+            <div class="download-icon">📱</div>
+            <div class="download-title">Android 客户端</div>
+            <div class="download-version">版本：$ANDROID_VERSION</div>
+            <a href="iflv-android.apk" class="download-button">下载</a>
+        </div>
+        
+        <div class="download-item">
+            <div class="download-icon">🖥️</div>
+            <div class="download-title">Windows 客户端</div>
+            <div class="download-version">版本：$WINDOWS_VERSION</div>
+            <a href="iflv-windows.zip" class="download-button">下载</a>
+        </div>
+        
+        <div class="download-item">
+            <div class="download-icon">🍎</div>
+            <div class="download-title">macOS 客户端</div>
+            <div class="download-version">版本：$MAC_VERSION</div>
+            <a href="iflv-mac.zip" class="download-button">下载</a>
+        </div>
+        
+        <div class="download-item">
+            <div class="download-icon">📱</div>
+            <div class="download-title">iOS 客户端</div>
+            <div class="download-version">版本：$IOS_VERSION</div>
+            <a href="iflv-ios.html" class="download-button">查看说明</a>
+        </div>
+    </div>
+
+    <div class="footer">
+        <p>IFLV © 2023-2024 | 版本 $ANDROID_VERSION</p>
+    </div>
+</body>
+</html>
+EOF
+
+    # 为iOS创建特殊说明页面
+    cat > /usr/share/iflv/downloads/iflv-ios.html << EOF
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IFLV iOS安装说明</title>
+    <style>
+        body {
+            font-family: 'Helvetica Neue', Arial, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        h1 {
+            color: #2c3e50;
+            margin-bottom: 20px;
+        }
+        .content {
+            background-color: white;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 30px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+        .step {
+            margin-bottom: 20px;
+        }
+        .step-title {
+            font-weight: bold;
+            margin-bottom: 10px;
+            font-size: 1.1em;
+            color: #2c3e50;
+        }
+        .footer {
+            margin-top: 50px;
+            text-align: center;
+            color: #7f8c8d;
+            font-size: 0.9em;
+        }
+        .back-button {
+            display: inline-block;
+            background-color: #3498db;
+            color: white;
+            padding: 8px 16px;
+            border-radius: 4px;
+            text-decoration: none;
+            transition: background-color 0.3s ease;
+            margin-top: 20px;
+        }
+        .back-button:hover {
+            background-color: #2980b9;
+        }
+        .note {
+            background-color: #f8f9fa;
+            border-left: 4px solid #3498db;
+            padding: 10px 15px;
+            margin: 15px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>IFLV iOS客户端安装说明</h1>
+    </div>
+
+    <div class="content">
+        <p>由于苹果App Store政策限制，iOS设备需要通过TestFlight或使用通用播放器来观看IFLV内容。</p>
+        
+        <div class="step">
+            <div class="step-title">方法一：使用TestFlight安装（需要申请）</div>
+            <p>请发送您的Apple ID邮箱到我们的支持邮箱，我们将邀请您加入TestFlight测试计划。</p>
+            <ol>
+                <li>在App Store中下载安装TestFlight应用</li>
+                <li>等待收到我们发送的TestFlight邀请邮件</li>
+                <li>点击邮件中的链接，在TestFlight中安装IFLV应用</li>
+            </ol>
+        </div>
+        
+        <div class="step">
+            <div class="step-title">方法二：使用其他播放器</div>
+            <p>您可以使用支持M3U播放列表的通用播放器来播放IFLV内容。</p>
+            <ol>
+                <li>在App Store中搜索并下载安装VLC、IINA等支持网络流媒体的播放器</li>
+                <li>在播放器中添加网络流地址：<code>http://[路由器IP]:8888/iflv.m3u</code></li>
+                <li>如果您的播放器支持，可以将此地址保存为收藏或播放列表</li>
+            </ol>
+            <div class="note">推荐的iOS播放器：VLC for Mobile、IINA+、nPlayer等</div>
+        </div>
+    </div>
+
+    <div style="text-align: center;">
+        <a href="index.html" class="back-button">返回下载页面</a>
+    </div>
+
+    <div class="footer">
+        <p>IFLV © 2023-2024 | 版本 $IOS_VERSION</p>
+    </div>
+</body>
+</html>
+EOF
+
+    # 复制logo到下载目录
+    if [ -f "/usr/share/iflv/assets/logo.png" ]; then
+        cp /usr/share/iflv/assets/logo.png /usr/share/iflv/downloads/logo.png
+    else
+        # 如果没有找到logo，创建一个简单的占位图标
+        cp /usr/share/iflv/assets/logo.png /usr/share/iflv/downloads/logo.png
+    fi
+}
+
+# 网络配置
+setup_network() {
+    case "$WORK_MODE" in
+        dual_line)
+            setup_dual_line_mode
+            ;;
+        vlan)
+            setup_vlan_mode
+            ;;
+        vlan_passthrough)
+            setup_vlan_passthrough_mode
+            ;;
+        *)
+            log "error" "未知的工作模式: $WORK_MODE"
+            exit 1
+            ;;
+    esac
+}
+
+# 双网线模式配置
+setup_dual_line_mode() {
+    log "info" "配置双网线模式..."
+    # 实际网络配置代码将在这里实现
+    # 由于具体配置取决于OpenWRT环境，这里只是示例
+}
+
+# VLAN模式配置
+setup_vlan_mode() {
+    log "info" "配置VLAN模式，VLAN ID: $VLAN_ID..."
+    # 实际网络配置代码将在这里实现
+}
+
+# VLAN透传模式配置
+setup_vlan_passthrough_mode() {
+    log "info" "配置VLAN透传模式，外网VLAN ID: $VLAN_ID，内网VLAN ID: $INNER_VLAN_ID..."
+    # 实际网络配置代码将在这里实现
+}
+
+# 启动数据包捕获
+start_packet_capture() {
+    log "info" "开始在端口 $MODEM_PORT 上捕获数据包..."
+    # 使用tcpdump捕获数据包
+    tcpdump -i "$MODEM_PORT" -n -v udp port 1234 -s 0 -w /tmp/iflv_capture.pcap &
+    TCPDUMP_PID=$!
+    log "debug" "tcpdump进程ID: $TCPDUMP_PID"
+    
+    # 设置定时任务，30分钟后分析数据包
+    (
+        sleep 1800  # 30分钟
+        log "info" "开始分析捕获的数据包..."
+        analyze_packets
+    ) &
+}
+
+# 分析捕获的数据包
+analyze_packets() {
+    # 检查tcpdump进程是否存在
+    if kill -0 $TCPDUMP_PID 2>/dev/null; then
+        log "info" "停止数据包捕获..."
+        kill $TCPDUMP_PID
+    fi
+    
+    log "info" "分析捕获文件: /tmp/iflv_capture.pcap"
+    # 数据包分析代码将在这里实现
+    # 提取组播地址、端口等信息
+    
+    # 更新EPG
+    update_epg
+    
+    # 配置IPTV模拟转发
+    configure_iptv_forwarding
+}
+
+# 更新EPG信息
+update_epg() {
+    log "info" "更新EPG信息..."
+    # EPG更新代码将在这里实现
+}
+
+# 配置IPTV模拟转发
+configure_iptv_forwarding() {
+    log "info" "配置IPTV转发规则..."
+    # IPTV转发配置代码将在这里实现
+}
+
+# 信号处理
+trap 'log "info" "收到终止信号，停止IFLV服务..."; exit 0' INT TERM QUIT
+
+# 主循环
+init
+while true; do
+    sleep 3600  # 每小时检查一次
+    log "debug" "服务运行中..."
+done 

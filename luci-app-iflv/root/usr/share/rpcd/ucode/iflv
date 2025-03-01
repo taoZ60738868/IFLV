@@ -1,0 +1,229 @@
+#!/usr/bin/ucode
+/*
+ * IFLV - IPTV转发系统
+ * RPC API 接口
+ */
+
+'use strict';
+
+import { readfile, writefile, popen, access, glob, lsdir } from 'fs';
+import { connect } from 'ubus';
+import { cursor } from 'uci';
+
+/* 频道相关API */
+let channels = {
+	/* 获取频道状态 */
+	status: function() {
+		return { result: {} };
+	},
+	
+	/* 导出频道列表 */
+	export: function() {
+		return { file: '/tmp/iflv_channels_export.json' };
+	},
+	
+	/* 导入频道列表 */
+	import: function(path) {
+		if (!path || !access(path, 'r'))
+			return { result: false };
+		
+		return { result: true };
+	},
+	
+	/* 测试频道 */
+	test: function(name) {
+		if (!name)
+			return { result: false };
+		
+		/* 随机返回测试结果，实际环境中需要实现真正的测试逻辑 */
+		return { result: true };
+	}
+};
+
+/* 代理相关API */
+let proxy = {
+	/* 获取代理状态 */
+	status: function() {
+		let result = {
+			running: false,
+			bind_addr: '0.0.0.0',
+			http_port: 8888,
+			https_port: null,
+			active_connections: 0,
+			transferred_bytes: 0,
+			lan_ip: '192.168.1.1'
+		};
+		
+		/* 检查服务是否运行 */
+		let service_status = popen('/etc/init.d/iflv status');
+		if (service_status && service_status.includes('running'))
+			result.running = true;
+			
+		/* 获取网络信息 */
+		let network = connect('network.interface');
+		if (network) {
+			let status = network.status({ interface: 'lan' });
+			if (status && status['ipv4-address'] && status['ipv4-address'].length > 0)
+				result.lan_ip = status['ipv4-address'][0].address;
+		}
+		
+		/* 获取配置信息 */
+		let uci = cursor();
+		
+		uci.load('iflv');
+		
+		let http_port = uci.get('iflv', 'proxy', 'http_port');
+		if (http_port)
+			result.http_port = http_port;
+			
+		let https_port = uci.get('iflv', 'proxy', 'https_port');
+		if (https_port)
+			result.https_port = https_port;
+			
+		let bind_addr = uci.get('iflv', 'proxy', 'bind_addr');
+		if (bind_addr)
+			result.bind_addr = bind_addr;
+		
+		return { result };
+	}
+};
+
+/* 系统相关API */
+let system = {
+	/* 获取系统信息 */
+	info: function() {
+		let result = {
+			version: '1.0.0',
+			build_date: '2023-03-01',
+			cpu_usage: '0%',
+			memory_usage: '0%',
+			disk_usage: '0%',
+			uptime: 0
+		};
+		
+		/* 获取CPU使用率 */
+		let cpu = popen("top -bn1 | grep 'Cpu(s)' | sed 's/.*, *\\([0-9.]*\\)%* id.*/\\1/' | awk '{print 100 - $1\"%\"}'");
+		if (cpu)
+			result.cpu_usage = cpu.trim();
+		
+		/* 获取内存使用率 */
+		let mem = popen("free | grep Mem | awk '{print int($3/$2 * 100)\"%\"}'");
+		if (mem)
+			result.memory_usage = mem.trim();
+		
+		/* 获取磁盘使用率 */
+		let disk = popen("df / | grep / | awk '{print $5}'");
+		if (disk)
+			result.disk_usage = disk.trim();
+		
+		/* 获取运行时间 */
+		let uptime = popen("cat /proc/uptime | awk '{print int($1)}'");
+		if (uptime)
+			result.uptime = int(uptime.trim());
+		
+		return { result };
+	}
+};
+
+/* 日志相关API */
+let log = {
+	/* 读取日志 */
+	read: function(lines) {
+		let log_lines = [];
+		let count = int(lines || 50);
+		
+		// 检查日志文件是否存在
+		if (!access('/var/log/iflv.log', 'r')) {
+			return { lines: log_lines };
+		}
+		
+		// 读取日志文件最后N行
+		let log_data = popen(`tail -n ${count} /var/log/iflv.log`);
+		if (log_data) {
+			log_lines = split(log_data, '\n');
+		}
+		
+		return { lines: log_lines };
+	},
+	
+	/* 清空日志 */
+	clear: function() {
+		let result = false;
+		
+		// 清空日志文件
+		if (access('/var/log/iflv.log', 'w')) {
+			writefile('/var/log/iflv.log', '');
+			result = true;
+		}
+		
+		return { result };
+	},
+	
+	/* 获取诊断信息 */
+	diagnostics: function() {
+		let items = [];
+		
+		// 检查服务状态
+		let service_status = popen('/etc/init.d/iflv status');
+		if (!service_status || !service_status.includes('running')) {
+			items.push({
+				level: 'error',
+				title: 'IFLV服务未运行',
+				description: '服务未启动或运行异常',
+				solution: '请尝试启动服务或检查日志获取详细错误信息'
+			});
+		}
+		
+		// 检查网口配置
+		let uci = cursor();
+		uci.load('iflv');
+		
+		let work_mode = uci.get('iflv', 'globals', 'work_mode');
+		let modem_port = uci.get('iflv', 'interface', 'modem_port');
+		let stb_port = uci.get('iflv', 'interface', 'stb_port');
+		
+		if (work_mode == 'dual_line' && (!modem_port || !stb_port)) {
+			items.push({
+				level: 'warn',
+				title: '网口配置不完整',
+				description: '双网线模式下需要配置光猫IPTV口和机顶盒口',
+				solution: '请在"网口绑定"页面完成配置'
+			});
+		}
+		
+		// 检查磁盘空间
+		let disk = popen("df /usr | awk 'NR==2 {print $5}'");
+		if (disk && parseInt(disk.trim()) > 90) {
+			items.push({
+				level: 'warn',
+				title: '磁盘空间不足',
+				description: '系统磁盘空间使用率超过90%',
+				solution: '清理不必要的文件释放空间'
+			});
+		}
+		
+		// 检查日志文件大小
+		let log_size = popen("du -h /var/log/iflv.log | awk '{print $1}'");
+		if (log_size && log_size.includes('M')) {
+			let size_value = parseFloat(log_size);
+			if (size_value > 10) {
+				items.push({
+					level: 'info',
+					title: '日志文件较大',
+					description: '日志文件大小超过10MB',
+					solution: '建议清空日志以释放空间'
+				});
+			}
+		}
+		
+		return { result: { items } };
+	}
+};
+
+return {
+	/* 导出API */
+	'iflv.channels': channels,
+	'iflv.proxy': proxy,
+	'iflv.system': system,
+	'iflv.log': log
+}; 

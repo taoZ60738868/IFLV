@@ -1,0 +1,31 @@
+{
+	"luci-app-iflv": {
+		"description": "Grant access to IFLV",
+		"read": {
+			"ubus": {
+				"service": [ "list" ],
+				"iflv.channels": [ "status", "export", "import", "test" ],
+				"iflv.proxy": [ "status" ],
+				"iflv.system": [ "info" ],
+				"iflv.log": [ "read", "clear", "diagnostics" ],
+				"file": [ "read", "write", "list" ]
+			},
+			"uci": [ "iflv" ],
+			"file": {
+				"/var/log/iflv.log": [ "read" ],
+				"/tmp/iflv_*": [ "read" ],
+				"/usr/share/iflv/*": [ "read" ],
+				"/usr/bin/iflv*": [ "exec" ],
+				"/etc/init.d/iflv": [ "exec" ]
+			}
+		},
+		"write": {
+			"uci": [ "iflv" ],
+			"file": {
+				"/usr/share/iflv/custom_parser.js": [ "write" ],
+				"/usr/share/iflv/channels.json": [ "write" ],
+				"/tmp/iflv_*": [ "write" ]
+			}
+		}
+	}
+} 

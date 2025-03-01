@@ -1,0 +1,40 @@
+config globals 'globals'
+	option enabled '0'
+	option work_mode 'dual_line' # dual_line, vlan, vlan_passthrough
+	option iptv_provider 'china_telecom'
+	option iptv_region 'shanghai'
+	option platform 'openwrt' # openwrt, istore, aiquik, xiaomi, synology, docker
+	
+config interface 'interface'
+	option modem_port ''
+	option stb_port ''
+	option vlan_id ''
+	option inner_vlan_id ''
+	
+config epg 'epg'
+	option update_interval '12' # hours
+	option primary_source 'default'
+	option auto_match '1'
+	
+config system 'system'
+	option log_level 'info' # debug, info, warn, error
+	option auto_start '1'
+	option auto_analyze '1'
+	
+config download 'download'
+	option enabled '1'
+	option port '8899'
+	option https_enabled '0'
+	option https_port '8443'
+	option auth_required '0'
+	option username 'admin'
+	option password 'iflv123'
+
+config client 'client'
+	option auto_update '1'
+	option update_interval '24' # hours
+	option auto_start '1'
+	option android_version '0.2.0'
+	option windows_version '0.2.0'
+	option mac_version '0.2.0'
+	option ios_version '0.2.0' 

@@ -1,0 +1,61 @@
+{
+	"admin/services/iflv": {
+		"title": "IFLV",
+		"order": 90,
+		"action": {
+			"type": "firstchild"
+		},
+		"depends": {
+			"acl": ["luci-app-iflv"],
+			"uci": { "iflv": true }
+		}
+	},
+	"admin/services/iflv/status": {
+		"title": "运行状态",
+		"order": 10,
+		"action": {
+			"type": "view",
+			"path": "iflv/status"
+		}
+	},
+	"admin/services/iflv/interfaces": {
+		"title": "网口绑定",
+		"order": 20,
+		"action": {
+			"type": "view",
+			"path": "iflv/interfaces"
+		}
+	},
+	"admin/services/iflv/epg": {
+		"title": "EPG列表",
+		"order": 30,
+		"action": {
+			"type": "view",
+			"path": "iflv/epg"
+		}
+	},
+	"admin/services/iflv/proxy": {
+		"title": "IPTV模拟",
+		"order": 40,
+		"action": {
+			"type": "view",
+			"path": "iflv/proxy"
+		}
+	},
+	"admin/services/iflv/settings": {
+		"title": "系统设置",
+		"order": 50,
+		"action": {
+			"type": "view",
+			"path": "iflv/settings"
+		}
+	},
+	"admin/services/iflv/log": {
+		"title": "系统日志",
+		"order": 60,
+		"action": {
+			"type": "view",
+			"path": "iflv/log"
+		}
+	}
+} 
