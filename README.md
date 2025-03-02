@@ -56,10 +56,10 @@ wget -O /tmp/install.sh https://iflv.io/install.sh && chmod +x /tmp/install.sh &
 
 | 架构 | 下载链接 |
 |------|----------|
-| x86_64 | [luci-app-iflv_1.1.0_x86_64.ipk](https://iflv.io/download/luci-app-iflv_1.1.0_x86_64.ipk) |
-| arm_cortex-a7 | [luci-app-iflv_1.1.0_arm_cortex-a7.ipk](https://iflv.io/download/luci-app-iflv_1.1.0_arm_cortex-a7.ipk) |
-| arm_cortex-a9 | [luci-app-iflv_1.1.0_arm_cortex-a9.ipk](https://iflv.io/download/luci-app-iflv_1.1.0_arm_cortex-a9.ipk) |
-| mipsel_24kc | [luci-app-iflv_1.1.0_mipsel_24kc.ipk](https://iflv.io/download/luci-app-iflv_1.1.0_mipsel_24kc.ipk) |
+| x86_64 | [luci-app-iflv_1.1.0_x86_64.ipk](packages/1.1.0/luci-app-iflv_1.1.0_x86_64.ipk) |
+| arm_cortex-a7 | [luci-app-iflv_1.1.0_arm_cortex-a7.ipk](packages/1.1.0/luci-app-iflv_1.1.0_arm_cortex-a7.ipk) |
+| arm_cortex-a9 | [luci-app-iflv_1.1.0_arm_cortex-a9.ipk](packages/1.1.0/luci-app-iflv_1.1.0_arm_cortex-a9.ipk) |
+| mipsel_24kc | [luci-app-iflv_1.1.0_mipsel_24kc.ipk](packages/1.1.0/luci-app-iflv_1.1.0_mipsel_24kc.ipk) |
 
 如果您不确定自己的设备架构，可以通过SSH连接到路由器后执行以下命令查看：
 ```bash
@@ -139,11 +139,11 @@ opkg print-architecture
 
 ## 下载链接
 
-- [OpenWRT插件包](https://iflv.io/download/)
-- [Android客户端](https://iflv.io/download/android/)
-- [Windows客户端](https://iflv.io/download/windows/)
-- [iOS客户端](https://iflv.io/download/ios/)
-- [Mac客户端](https://iflv.io/download/mac/)
+- [OpenWRT插件包](packages/)
+- [Android客户端](packages/clients/android/)
+- [Windows客户端](packages/clients/windows/)
+- [iOS客户端](packages/clients/ios/)
+- [Mac客户端](packages/clients/mac/)
 
 ## 文档资源
 
