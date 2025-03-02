@@ -4,13 +4,13 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-iflv
-PKG_VERSION:=0.2.0
+PKG_VERSION:=1.0.0
 PKG_RELEASE:=1
 
 PKG_MAINTAINER:=IFLV Team
 
 LUCI_TITLE:=LuCI support for IFLV (IPTV转发系统)
-LUCI_DEPENDS:=+luci-base +tcpdump +iptables-mod-filter +iptables-mod-ipopt +ipset +kmod-ipt-ipset +libuci +wget +unzip +tar +gzip
+LUCI_DEPENDS:=+luci-base +tcpdump +iptables-mod-filter +iptables-mod-ipopt +ipset +kmod-ipt-ipset +libuci +wget +unzip +tar +gzip +libustream-openssl +ca-bundle +ca-certificates +openssl-util
 
 # iStore兼容
 LUCI_PKGARCH:=all
@@ -98,10 +98,16 @@ define Package/$(PKG_NAME)/postinst
 if [ -z "$${IPKG_INSTROOT}" ]; then
 	( . /etc/uci-defaults/luci-app-iflv ) && rm -f /etc/uci-defaults/luci-app-iflv
 	mkdir -p /usr/share/iflv/downloads
+	mkdir -p /usr/share/iflv/epg
+	mkdir -p /usr/share/iflv/clients
 	rm -f /tmp/luci-indexcache
 	rm -f /tmp/luci-modulecache/*
 	chmod +x /usr/bin/iflv*
 	/etc/init.d/iflv enable >/dev/null 2>&1
+	# 安装完成后自动启动服务
+	/etc/init.d/iflv start >/dev/null 2>&1
+	# 触发首次EPG更新
+	( sleep 30 && /usr/bin/iflv_update_epg ) &
 fi
 exit 0
 endef

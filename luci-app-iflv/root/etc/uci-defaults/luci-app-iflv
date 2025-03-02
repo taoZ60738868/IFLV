@@ -43,88 +43,116 @@ else
 EOF
 fi
 
-# 创建默认配置文件
-if [ -f "/etc/config/iflv" ]; then
-    echo '配置文件已存在'
-else
-    echo '创建默认配置文件'
-    cat > /etc/config/iflv << EOF
-config globals 'globals'
-	option enabled '0'
-	option work_mode 'dual_line'
-	option iptv_provider 'china_telecom'
-	option iptv_region 'shanghai'
-	option platform 'openwrt'
-	
-config interface 'interface'
-	option modem_port ''
-	option stb_port ''
-	option vlan_id ''
-	option inner_vlan_id ''
-	
-config epg 'epg'
-	option update_interval '12'
-	option primary_source 'default'
-	option auto_match '1'
+# 添加IFLV包到防火墙允许列表
+uci -q delete firewall.iflv
+uci set firewall.iflv=include
+uci set firewall.iflv.type=script
+uci set firewall.iflv.path=/usr/share/iflv/firewall.include
+uci set firewall.iflv.reload=1
 
-config system 'system'
-	option log_level 'info'
-	option auto_start '1'
-	option auto_analyze '1'
-	
-config download 'download'
-	option enabled '1'
-	option port '8899'
-	option https_enabled '0'
-	option https_port '8443'
-	option auth_required '0'
-	option username 'admin'
-	option password 'iflv123'
+# 添加IFLV到LuCI菜单
+uci -q delete ucitrack.@iflv[-1]
+uci add ucitrack iflv
+uci set ucitrack.@iflv[-1].init=iflv
+uci commit ucitrack
 
-config client 'client'
-	option auto_update '1'
-	option update_interval '24'
-	option auto_start '1'
-	option android_version '0.2.0'
-	option windows_version '0.2.0'
-	option mac_version '0.2.0'
-	option ios_version '0.2.0'
+# 创建默认配置（如果不存在）
+if [ ! -f "/etc/config/iflv" ]; then
+    # 创建基本配置结构
+    uci -q batch <<-EOF >/dev/null
+        set iflv.globals=globals
+        set iflv.globals.enabled='1'
+        set iflv.globals.work_mode='double'
+        set iflv.globals.version='1.0.0'
+        
+        add iflv interface
+        set iflv.@interface[-1].wan_if='eth1'
+        set iflv.@interface[-1].lan_if='br-lan'
+        
+        add iflv vlan_config
+        set iflv.@vlan_config[-1].vlan_id='85'
+        set iflv.@vlan_config[-1].inner_vlan_id='10'
+        
+        add iflv service
+        set iflv.@service[-1].port='8888'
+        set iflv.@service[-1].buffer_size='8192'
+        set iflv.@service[-1].cache_time='300'
+        
+        add iflv download
+        set iflv.@download[-1].enabled='1'
+        set iflv.@download[-1].port='8899'
+        set iflv.@download[-1].auth_required='0'
+        set iflv.@download[-1].username='admin'
+        set iflv.@download[-1].password='iflv123'
+        
+        add iflv epg
+        set iflv.@epg[-1].enabled='1'
+        set iflv.@epg[-1].update_interval='24'
+        set iflv.@epg[-1].sources='http://epg.51zmt.top:8000/e.xml|https://epg.112114.xyz/e.xml'
+        set iflv.@epg[-1].cache_days='7'
+        
+        add iflv client
+        set iflv.@client[-1].android_version='1.0.0'
+        set iflv.@client[-1].windows_version='1.0.0'
+        set iflv.@client[-1].mac_version='1.0.0'
+        set iflv.@client[-1].ios_version='1.0.0'
+        
+        commit iflv
 EOF
 fi
 
-# 创建必要的目录
-mkdir -p /usr/share/iflv
-mkdir -p /usr/share/iflv/assets
-mkdir -p /usr/share/iflv/downloads
+# 添加防火墙规则
+cat > /usr/share/iflv/firewall.include <<EOF
+#!/bin/sh
+
+# IFLV防火墙规则
+
+# 获取配置
+. /lib/functions.sh
+config_load 'iflv'
+
+# 服务端口
+config_get PORT service port '8888'
+# 下载服务端口
+config_get DOWNLOAD_PORT download port '8899'
+
+# 添加IPTV转发服务端口到防火墙
+iptables -t filter -I INPUT -p tcp --dport \$PORT -j ACCEPT 2>/dev/null
+iptables -t filter -I INPUT -p udp --dport \$PORT -j ACCEPT 2>/dev/null
+
+# 添加下载服务端口到防火墙
+iptables -t filter -I INPUT -p tcp --dport \$DOWNLOAD_PORT -j ACCEPT 2>/dev/null
+
+# 允许组播流量
+iptables -t filter -I INPUT -p igmp -j ACCEPT 2>/dev/null
+iptables -t filter -I OUTPUT -p igmp -j ACCEPT 2>/dev/null
+iptables -t filter -I FORWARD -p igmp -j ACCEPT 2>/dev/null
+
+# 允许UDP组播流量
+iptables -t filter -I INPUT -p udp -d 224.0.0.0/4 -j ACCEPT 2>/dev/null
+iptables -t filter -I OUTPUT -p udp -d 224.0.0.0/4 -j ACCEPT 2>/dev/null
+iptables -t filter -I FORWARD -p udp -d 224.0.0.0/4 -j ACCEPT 2>/dev/null
+
+# 对于IPv6，添加类似规则
+ip6tables -t filter -I INPUT -p tcp --dport \$PORT -j ACCEPT 2>/dev/null
+ip6tables -t filter -I INPUT -p udp --dport \$PORT -j ACCEPT 2>/dev/null
+ip6tables -t filter -I INPUT -p tcp --dport \$DOWNLOAD_PORT -j ACCEPT 2>/dev/null
+EOF
+
+# 设置防火墙脚本可执行
+chmod +x /usr/share/iflv/firewall.include
+
+# 加载防火墙规则
+/usr/share/iflv/firewall.include
+
+# 重启防火墙
+/etc/init.d/firewall restart >/dev/null 2>&1
 
 # 设置权限
-chmod +x /usr/bin/iflv*
 chmod +x /etc/init.d/iflv
+chmod +x /usr/bin/iflv*
 
-# 检测平台类型
-/usr/bin/iflv check_platform
-
-# 设置防火墙规则（如果需要）
-if grep -q "iflv" /etc/firewall.user; then
-    echo '防火墙规则已存在'
-else
-    echo '添加防火墙规则'
-    cat >> /etc/firewall.user << EOF
-# IFLV - 允许客户端下载端口
-iptables -A INPUT -p tcp --dport 8899 -j ACCEPT
-EOF
-fi
-
-# 自动检测是否为iStore环境
-if [ -d "/tmp/istore" ] || [ -f "/etc/istore.info" ]; then
-    echo '检测到iStore环境，进行特殊配置'
-    # iStore特定配置可以在这里添加
-fi
-
-# 启用服务自启动
+# 设置开机自启
 /etc/init.d/iflv enable
-
-# 重启ubusd使ACL生效
-/etc/init.d/rpcd restart
 
 exit 0 

@@ -1,0 +1,867 @@
+#!/bin/sh
+
+# IFLV 客户端下载服务器
+# 版本: 1.0.1
+# 支持功能: 客户端安装包下载、版本更新检查、自动更新、HTTPS支持
+
+# 设置颜色输出
+COLOR_INFO='\033[0;32m'
+COLOR_WARN='\033[0;33m'
+COLOR_ERROR='\033[0;31m'
+COLOR_DEBUG='\033[0;34m'
+COLOR_NC='\033[0m' # 无颜色
+
+# 常量定义
+DOWNLOAD_DIR="/usr/share/iflv/downloads"
+CLIENTS_DIR="/usr/share/iflv/clients"
+TEMP_DIR="/tmp/iflv_download_temp"
+LOG_FILE="/var/log/iflv.log"
+PID_FILE="/var/run/iflv_download.pid"
+CONFIG_FILE="/etc/config/iflv"
+VERSION_INFO_FILE="$DOWNLOAD_DIR/versions.json"
+SSL_DIR="/usr/share/iflv/ssl"
+SSL_CERT="$SSL_DIR/cert.pem"
+SSL_KEY="$SSL_DIR/key.pem"
+
+# 创建必要的目录
+mkdir -p $DOWNLOAD_DIR
+mkdir -p $CLIENTS_DIR
+mkdir -p $TEMP_DIR
+mkdir -p $SSL_DIR
+
+# 日志函数
+log() {
+    local level="$1"
+    local message="$2"
+    local color="$COLOR_NC"
+    
+    case "$level" in
+        "info") color="$COLOR_INFO" ;;
+        "warn") color="$COLOR_WARN" ;;
+        "error") color="$COLOR_ERROR" ;;
+        "debug") color="$COLOR_DEBUG" ;;
+    esac
+    
+    # 输出到控制台
+    echo -e "${color}[IFLV-Download] $(date '+%Y-%m-%d %H:%M:%S') $level: $message${COLOR_NC}"
+    
+    # 记录到日志文件
+    echo "[IFLV-Download] $(date '+%Y-%m-%d %H:%M:%S') $level: $message" >> "$LOG_FILE"
+}
+
+# 检查锁文件
+check_lock() {
+    if [ -f "$PID_FILE" ]; then
+        local pid=$(cat "$PID_FILE")
+        if kill -0 "$pid" 2>/dev/null; then
+            log "warn" "已经有一个下载服务进程在运行 (PID: $pid)"
+            
+            # 检查锁文件创建时间，如果超过6小时，可能是僵尸进程
+            local lock_time=$(stat -c %Y "$PID_FILE")
+            local current_time=$(date +%s)
+            local diff=$(( current_time - lock_time ))
+            
+            if [ $diff -gt 21600 ]; then
+                log "warn" "锁文件超过6小时，可能是僵尸进程，尝试强制删除"
+                rm -f "$PID_FILE"
+                echo $$ > "$PID_FILE"
+                return 0
+            else
+                return 1
+            fi
+        else
+            log "warn" "发现过期的锁文件，正在删除"
+            rm -f "$PID_FILE"
+        fi
+    fi
+    
+    # 创建锁文件
+    echo $$ > "$PID_FILE"
+    log "debug" "创建锁文件，PID: $$"
+    return 0
+}
+
+# 清理函数
+cleanup() {
+    log "debug" "清理临时文件和锁文件"
+    rm -rf "$TEMP_DIR"
+    rm -f "$PID_FILE"
+}
+
+# 设置信号处理
+trap cleanup EXIT INT TERM
+
+# 获取配置
+fetch_config() {
+    log "info" "获取下载服务配置"
+    
+    # 加载UCI配置
+    . /lib/functions.sh
+    config_load 'iflv'
+    
+    # 获取下载服务配置
+    local enabled
+    local port
+    local auth_required
+    local username
+    local password
+    local https_enabled
+    local https_port
+    local cert_file
+    local key_file
+    local auto_cert
+    local check_updates
+    
+    config_get enabled download enabled "1"
+    config_get port download port "8899"
+    config_get auth_required download auth_required "0"
+    config_get username download username "admin"
+    config_get password download password "iflv123"
+    config_get https_enabled download https_enabled "0"
+    config_get https_port download https_port "8443"
+    config_get cert_file download cert_file ""
+    config_get key_file download key_file ""
+    config_get auto_cert download auto_cert "1"
+    config_get check_updates download check_updates "1"
+    
+    if [ "$enabled" != "1" ]; then
+        log "info" "下载服务功能未启用"
+        exit 0
+    fi
+    
+    DOWNLOAD_PORT="$port"
+    AUTH_REQUIRED="$auth_required"
+    AUTH_USERNAME="$username"
+    AUTH_PASSWORD="$password"
+    HTTPS_ENABLED="$https_enabled"
+    HTTPS_PORT="$https_port"
+    CERT_FILE="$cert_file"
+    KEY_FILE="$key_file"
+    AUTO_CERT="$auto_cert"
+    CHECK_UPDATES="$check_updates"
+    
+    log "info" "下载服务配置: 端口=$DOWNLOAD_PORT, HTTPS=${HTTPS_ENABLED}:${HTTPS_PORT}, 认证=${AUTH_REQUIRED}"
+    
+    # 如果启用了HTTPS但没有指定证书和密钥，则检查是否需要自动生成
+    if [ "$HTTPS_ENABLED" = "1" ] && [ -z "$CERT_FILE" ] && [ -z "$KEY_FILE" ] && [ "$AUTO_CERT" = "1" ]; then
+        generate_self_signed_cert
+    elif [ "$HTTPS_ENABLED" = "1" ] && [ -n "$CERT_FILE" ] && [ -n "$KEY_FILE" ]; then
+        # 使用指定的证书和密钥
+        if [ -f "$CERT_FILE" ] && [ -f "$KEY_FILE" ]; then
+            cp "$CERT_FILE" "$SSL_CERT"
+            cp "$KEY_FILE" "$SSL_KEY"
+            log "info" "使用指定的SSL证书和密钥"
+        else
+            log "error" "指定的SSL证书或密钥文件不存在，尝试使用自动生成"
+            generate_self_signed_cert
+        fi
+    fi
+}
+
+# 生成自签名证书
+generate_self_signed_cert() {
+    log "info" "生成自签名SSL证书..."
+    
+    # 检查是否已存在证书
+    if [ -f "$SSL_CERT" ] && [ -f "$SSL_KEY" ]; then
+        log "info" "SSL证书已存在，使用现有证书"
+        return 0
+    fi
+    
+    # 检查openssl是否可用
+    if ! command -v openssl >/dev/null 2>&1; then
+        log "error" "未找到openssl命令，无法生成SSL证书"
+        return 1
+    fi
+    
+    # 获取路由器IP作为证书CN
+    local router_ip=$(ip -4 addr show br-lan 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n 1)
+    if [ -z "$router_ip" ]; then
+        router_ip=$(ip -4 addr show eth0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n 1)
+    fi
+    if [ -z "$router_ip" ]; then
+        router_ip="iflv.local"
+    fi
+    
+    # 生成私钥和证书
+    openssl req -new -newkey rsa:2048 -days 3650 -nodes -x509 \
+        -subj "/CN=${router_ip}/O=IFLV Self-Signed/C=CN" \
+        -keyout "$SSL_KEY" -out "$SSL_CERT" 2>/dev/null
+    
+    if [ -f "$SSL_CERT" ] && [ -f "$SSL_KEY" ]; then
+        log "info" "SSL证书生成成功"
+        return 0
+    else
+        log "error" "SSL证书生成失败"
+        return 1
+    fi
+}
+
+# 检查与更新客户端版本
+check_client_versions() {
+    log "info" "检查客户端版本更新"
+    
+    if [ "$CHECK_UPDATES" != "1" ]; then
+        log "info" "客户端版本检查未启用，跳过"
+        return 0
+    fi
+    
+    # 创建版本信息文件（如果不存在）
+    if [ ! -f "$VERSION_INFO_FILE" ]; then
+        cat > "$VERSION_INFO_FILE" << EOF
+{
+  "android": {
+    "version": "1.0.0",
+    "url": "https://iflv.io/downloads/android/iflv-1.0.0.apk",
+    "date": "2024-03-01",
+    "description": "初始版本"
+  },
+  "windows": {
+    "version": "1.0.0",
+    "url": "https://iflv.io/downloads/windows/iflv-1.0.0.exe",
+    "date": "2024-03-01",
+    "description": "初始版本"
+  },
+  "mac": {
+    "version": "1.0.0",
+    "url": "https://iflv.io/downloads/mac/iflv-1.0.0.dmg",
+    "date": "2024-03-01",
+    "description": "初始版本"
+  },
+  "ios": {
+    "version": "1.0.0",
+    "url": "https://testflight.apple.com/join/iflv",
+    "date": "2024-03-01",
+    "description": "初始版本，通过TestFlight分发"
+  }
+}
+EOF
+        log "info" "创建默认版本信息文件"
+    fi
+    
+    # 尝试从官方源获取最新版本信息
+    local version_url="https://iflv.io/api/versions.json"
+    local temp_version_file="${TEMP_DIR}/versions.json"
+    
+    log "info" "尝试从 $version_url 获取最新版本信息"
+    
+    if command -v wget >/dev/null 2>&1; then
+        if wget -q --timeout=10 --tries=2 -O "$temp_version_file" "$version_url"; then
+            log "info" "成功获取最新版本信息"
+            
+            # 验证JSON格式
+            if command -v jq >/dev/null 2>&1; then
+                if jq . "$temp_version_file" >/dev/null 2>&1; then
+                    cp "$temp_version_file" "$VERSION_INFO_FILE"
+                    log "info" "更新版本信息成功"
+                else
+                    log "error" "获取的版本信息格式不正确"
+                fi
+            else
+                # 如果没有jq，做简单检查
+                if grep -q '"version"' "$temp_version_file"; then
+                    cp "$temp_version_file" "$VERSION_INFO_FILE"
+                    log "info" "更新版本信息成功"
+                else
+                    log "error" "获取的版本信息格式不正确"
+                fi
+            fi
+        else
+            log "warn" "获取最新版本信息失败，使用本地缓存"
+        fi
+    elif command -v curl >/dev/null 2>&1; then
+        if curl -s --connect-timeout 10 --retry 2 -o "$temp_version_file" "$version_url"; then
+            log "info" "成功获取最新版本信息"
+            
+            # 验证JSON格式
+            if command -v jq >/dev/null 2>&1; then
+                if jq . "$temp_version_file" >/dev/null 2>&1; then
+                    cp "$temp_version_file" "$VERSION_INFO_FILE"
+                    log "info" "更新版本信息成功"
+                else
+                    log "error" "获取的版本信息格式不正确"
+                fi
+            else
+                # 如果没有jq，做简单检查
+                if grep -q '"version"' "$temp_version_file"; then
+                    cp "$temp_version_file" "$VERSION_INFO_FILE"
+                    log "info" "更新版本信息成功"
+                else
+                    log "error" "获取的版本信息格式不正确"
+                fi
+            fi
+        else
+            log "warn" "获取最新版本信息失败，使用本地缓存"
+        fi
+    else
+        log "warn" "未找到wget或curl命令，无法检查更新"
+    fi
+    
+    return 0
+}
+
+# 下载并更新客户端安装包
+update_client_packages() {
+    log "info" "开始更新客户端安装包"
+    
+    if [ ! -f "$VERSION_INFO_FILE" ]; then
+        log "error" "版本信息文件不存在，无法更新客户端包"
+        return 1
+    fi
+    
+    # 创建客户端目录
+    mkdir -p "$CLIENTS_DIR/android"
+    mkdir -p "$CLIENTS_DIR/windows"
+    mkdir -p "$CLIENTS_DIR/mac"
+    mkdir -p "$CLIENTS_DIR/ios"
+    
+    # 读取版本信息
+    local android_url
+    local windows_url
+    local mac_url
+    
+    if command -v jq >/dev/null 2>&1; then
+        android_url=$(jq -r '.android.url' "$VERSION_INFO_FILE")
+        windows_url=$(jq -r '.windows.url' "$VERSION_INFO_FILE")
+        mac_url=$(jq -r '.mac.url' "$VERSION_INFO_FILE")
+    else
+        # 简单解析
+        android_url=$(grep -o '"url": "[^"]*"' "$VERSION_INFO_FILE" | grep android | cut -d'"' -f4)
+        windows_url=$(grep -o '"url": "[^"]*"' "$VERSION_INFO_FILE" | grep windows | cut -d'"' -f4)
+        mac_url=$(grep -o '"url": "[^"]*"' "$VERSION_INFO_FILE" | grep mac | cut -d'"' -f4)
+    fi
+    
+    # 下载Android客户端
+    if [ -n "$android_url" ]; then
+        local android_file="${CLIENTS_DIR}/android/iflv-latest.apk"
+        log "info" "尝试下载Android客户端: $android_url"
+        
+        download_file "$android_url" "$android_file"
+    fi
+    
+    # 下载Windows客户端
+    if [ -n "$windows_url" ]; then
+        local windows_file="${CLIENTS_DIR}/windows/iflv-latest.exe"
+        log "info" "尝试下载Windows客户端: $windows_url"
+        
+        download_file "$windows_url" "$windows_file"
+    fi
+    
+    # 下载Mac客户端
+    if [ -n "$mac_url" ]; then
+        local mac_file="${CLIENTS_DIR}/mac/iflv-latest.dmg"
+        log "info" "尝试下载Mac客户端: $mac_url"
+        
+        download_file "$mac_url" "$mac_file"
+    fi
+    
+    log "info" "客户端安装包更新完成"
+    return 0
+}
+
+# 通用文件下载函数
+download_file() {
+    local url="$1"
+    local output_file="$2"
+    local success=0
+    
+    if command -v wget >/dev/null 2>&1; then
+        if wget -q --timeout=30 --tries=3 -O "$output_file" "$url"; then
+            log "info" "成功下载: $url"
+            success=1
+        else
+            log "error" "下载失败: $url"
+        fi
+    elif command -v curl >/dev/null 2>&1; then
+        if curl -s --connect-timeout 30 --retry 3 -o "$output_file" "$url"; then
+            log "info" "成功下载: $url"
+            success=1
+        else
+            log "error" "下载失败: $url"
+        fi
+    else
+        log "error" "未找到wget或curl命令，无法下载"
+    fi
+    
+    return $success
+}
+
+# 准备下载页面
+prepare_download_page() {
+    log "info" "准备下载页面"
+    
+    # 创建下载目录
+    mkdir -p "$DOWNLOAD_DIR/css"
+    mkdir -p "$DOWNLOAD_DIR/js"
+    mkdir -p "$DOWNLOAD_DIR/images"
+    
+    # 创建主页
+    cat > "$DOWNLOAD_DIR/index.html" << EOF
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IFLV(假驴子) 客户端下载</title>
+    <link rel="stylesheet" href="css/style.css">
+    <link rel="icon" href="images/favicon.ico" type="image/x-icon">
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <img src="images/logo.png" alt="IFLV Logo" class="logo">
+            <h1>IFLV(假驴子) 客户端下载</h1>
+            <p class="subtitle">一次部署，全家IPTV随心看</p>
+        </div>
+        
+        <div class="clients-container">
+            <div class="client-card">
+                <img src="images/android.png" alt="Android" class="platform-icon">
+                <h2>Android 客户端</h2>
+                <p class="version">当前版本: <span id="android-version">1.0.0</span></p>
+                <p class="date">更新日期: <span id="android-date">2024-03-01</span></p>
+                <div class="description" id="android-desc">初始版本</div>
+                <a href="android/iflv-latest.apk" class="download-btn">下载安装包</a>
+            </div>
+            
+            <div class="client-card">
+                <img src="images/windows.png" alt="Windows" class="platform-icon">
+                <h2>Windows 客户端</h2>
+                <p class="version">当前版本: <span id="windows-version">1.0.0</span></p>
+                <p class="date">更新日期: <span id="windows-date">2024-03-01</span></p>
+                <div class="description" id="windows-desc">初始版本</div>
+                <a href="windows/iflv-latest.exe" class="download-btn">下载安装包</a>
+            </div>
+            
+            <div class="client-card">
+                <img src="images/mac.png" alt="Mac" class="platform-icon">
+                <h2>Mac 客户端</h2>
+                <p class="version">当前版本: <span id="mac-version">1.0.0</span></p>
+                <p class="date">更新日期: <span id="mac-date">2024-03-01</span></p>
+                <div class="description" id="mac-desc">初始版本</div>
+                <a href="mac/iflv-latest.dmg" class="download-btn">下载安装包</a>
+            </div>
+            
+            <div class="client-card">
+                <img src="images/ios.png" alt="iOS" class="platform-icon">
+                <h2>iOS 客户端</h2>
+                <p class="version">当前版本: <span id="ios-version">1.0.0</span></p>
+                <p class="date">更新日期: <span id="ios-date">2024-03-01</span></p>
+                <div class="description" id="ios-desc">通过TestFlight分发</div>
+                <a href="https://testflight.apple.com/join/iflv" class="download-btn" target="_blank">加入TestFlight</a>
+            </div>
+        </div>
+        
+        <div class="info-box">
+            <h3>使用说明</h3>
+            <p>1. 下载并安装对应平台的客户端</p>
+            <p>2. 客户端会自动发现同一网络内的IFLV服务</p>
+            <p>3. 如果未自动发现，请手动输入路由器IP地址</p>
+            <p>4. 开始享受全家多设备观看IPTV的便利</p>
+        </div>
+        
+        <div class="note">
+            <p>注意：iOS客户端需通过TestFlight安装。如不方便安装客户端，也可使用第三方播放器通过地址 <code>http://[路由器IP]:8888/iptv.m3u</code> 播放</p>
+        </div>
+        
+        <div class="footer">
+            <p>IFLV(假驴子) © 2024 | <a href="https://github.com/taoZ60738868/IFLV" target="_blank">项目主页</a></p>
+        </div>
+    </div>
+    
+    <script src="js/script.js"></script>
+</body>
+</html>
+EOF
+    
+    # 创建CSS样式
+    cat > "$DOWNLOAD_DIR/css/style.css" << EOF
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+    font-family: 'Microsoft YaHei', 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+}
+
+body {
+    background-color: #f5f5f5;
+    color: #333;
+    line-height: 1.6;
+}
+
+.container {
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 20px;
+}
+
+.header {
+    text-align: center;
+    margin-bottom: 40px;
+    padding: 20px;
+    background: #fff;
+    border-radius: 10px;
+    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+}
+
+.logo {
+    width: 120px;
+    height: auto;
+    margin-bottom: 15px;
+}
+
+h1 {
+    color: #2c3e50;
+    margin-bottom: 10px;
+    font-size: 2.2em;
+}
+
+.subtitle {
+    color: #7f8c8d;
+    font-size: 1.2em;
+}
+
+.clients-container {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 20px;
+    margin-bottom: 40px;
+}
+
+.client-card {
+    background: #fff;
+    border-radius: 10px;
+    padding: 25px;
+    width: 260px;
+    text-align: center;
+    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+    transition: transform 0.3s ease;
+}
+
+.client-card:hover {
+    transform: translateY(-5px);
+}
+
+.platform-icon {
+    width: 80px;
+    height: 80px;
+    margin-bottom: 15px;
+}
+
+h2 {
+    color: #2c3e50;
+    margin-bottom: 15px;
+    font-size: 1.5em;
+}
+
+.version, .date {
+    margin-bottom: 5px;
+    color: #7f8c8d;
+}
+
+.description {
+    margin: 15px 0;
+    min-height: 40px;
+    font-size: 0.9em;
+}
+
+.download-btn {
+    display: inline-block;
+    background: #3498db;
+    color: white;
+    padding: 10px 20px;
+    border-radius: 5px;
+    text-decoration: none;
+    font-weight: bold;
+    transition: background 0.3s ease;
+}
+
+.download-btn:hover {
+    background: #2980b9;
+}
+
+.info-box {
+    background: #fff;
+    border-radius: 10px;
+    padding: 25px;
+    margin-bottom: 30px;
+    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+}
+
+.info-box h3 {
+    color: #2c3e50;
+    margin-bottom: 15px;
+    font-size: 1.3em;
+}
+
+.info-box p {
+    margin-bottom: 10px;
+}
+
+.note {
+    background: #fdf5e6;
+    border-left: 4px solid #e67e22;
+    padding: 15px;
+    margin-bottom: 30px;
+    border-radius: 5px;
+}
+
+.note code {
+    background: #f1f1f1;
+    padding: 2px 5px;
+    border-radius: 3px;
+    font-family: monospace;
+}
+
+.footer {
+    text-align: center;
+    padding: 20px;
+    margin-top: 20px;
+    color: #7f8c8d;
+}
+
+.footer a {
+    color: #3498db;
+    text-decoration: none;
+}
+
+@media (max-width: 768px) {
+    .clients-container {
+        flex-direction: column;
+        align-items: center;
+    }
+    
+    .client-card {
+        width: 100%;
+        max-width: 320px;
+    }
+}
+EOF
+    
+    # 创建JavaScript
+    cat > "$DOWNLOAD_DIR/js/script.js" << EOF
+document.addEventListener('DOMContentLoaded', function() {
+    // 加载版本信息
+    fetch('versions.json')
+        .then(response => response.json())
+        .then(data => {
+            updateVersionInfo('android', data.android);
+            updateVersionInfo('windows', data.windows);
+            updateVersionInfo('mac', data.mac);
+            updateVersionInfo('ios', data.ios);
+        })
+        .catch(error => console.error('加载版本信息失败:', error));
+});
+
+function updateVersionInfo(platform, info) {
+    if (info) {
+        document.getElementById(platform + '-version').textContent = info.version || '1.0.0';
+        document.getElementById(platform + '-date').textContent = info.date || '2024-03-01';
+        document.getElementById(platform + '-desc').textContent = info.description || '初始版本';
+    }
+}
+EOF
+    
+    # 创建图标和图片的符号链接
+    mkdir -p "$DOWNLOAD_DIR/android"
+    mkdir -p "$DOWNLOAD_DIR/windows"
+    mkdir -p "$DOWNLOAD_DIR/mac"
+    
+    ln -sf "$CLIENTS_DIR/android" "$DOWNLOAD_DIR/android"
+    ln -sf "$CLIENTS_DIR/windows" "$DOWNLOAD_DIR/windows"
+    ln -sf "$CLIENTS_DIR/mac" "$DOWNLOAD_DIR/mac"
+    
+    # 检查并创建样板图片
+    if [ ! -f "$DOWNLOAD_DIR/images/logo.png" ]; then
+        # 这里应该复制实际的图片文件，但为简化脚本，暂时创建空文件
+        touch "$DOWNLOAD_DIR/images/logo.png"
+        touch "$DOWNLOAD_DIR/images/android.png"
+        touch "$DOWNLOAD_DIR/images/windows.png"
+        touch "$DOWNLOAD_DIR/images/mac.png"
+        touch "$DOWNLOAD_DIR/images/ios.png"
+        touch "$DOWNLOAD_DIR/images/favicon.ico"
+    fi
+    
+    # 复制版本信息文件到下载目录
+    cp "$VERSION_INFO_FILE" "$DOWNLOAD_DIR/versions.json"
+    
+    log "info" "下载页面准备完成"
+    return 0
+}
+
+# 启动HTTP服务
+start_http_server() {
+    log "info" "启动HTTP下载服务（端口: $DOWNLOAD_PORT）"
+    
+    # 检查uhttpd是否可用
+    if ! command -v uhttpd >/dev/null 2>&1; then
+        log "error" "未找到uhttpd命令，无法启动HTTP服务"
+        return 1
+    fi
+    
+    # 创建认证文件（如果需要）
+    if [ "$AUTH_REQUIRED" = "1" ]; then
+        local passwd_file="${DOWNLOAD_DIR}/.htpasswd"
+        if command -v htpasswd >/dev/null 2>&1; then
+            htpasswd -cb "$passwd_file" "$AUTH_USERNAME" "$AUTH_PASSWORD" >/dev/null 2>&1
+        else
+            # 简单实现密码加密（不安全，仅作示例）
+            local encrypted_pwd=$(echo -n "$AUTH_PASSWORD" | md5sum | awk '{print $1}')
+            echo "${AUTH_USERNAME}:${encrypted_pwd}" > "$passwd_file"
+        fi
+        
+        log "info" "已创建认证文件，用户名: $AUTH_USERNAME"
+        
+        # 启动支持认证的服务器
+        uhttpd -p "$DOWNLOAD_PORT" -h "$DOWNLOAD_DIR" -n 20 \
+            -T 30 -A 1 -N 100 -R -r "$passwd_file" -m /=:$AUTH_USERNAME >/dev/null 2>&1 &
+    else
+        # 启动无认证的服务器
+        uhttpd -p "$DOWNLOAD_PORT" -h "$DOWNLOAD_DIR" -n 20 \
+            -T 30 -A 1 -N 100 -R >/dev/null 2>&1 &
+    fi
+    
+    local http_pid=$!
+    log "info" "HTTP服务已启动 (PID: $http_pid)"
+    
+    # 启动HTTPS服务（如果启用）
+    if [ "$HTTPS_ENABLED" = "1" ] && [ -f "$SSL_CERT" ] && [ -f "$SSL_KEY" ]; then
+        log "info" "启动HTTPS下载服务（端口: $HTTPS_PORT）"
+        
+        if [ "$AUTH_REQUIRED" = "1" ]; then
+            # 启动支持认证的HTTPS服务器
+            uhttpd -p "$HTTPS_PORT" -h "$DOWNLOAD_DIR" -n 20 \
+                -T 30 -A 1 -N 100 -R -s "$SSL_CERT" -K "$SSL_KEY" \
+                -r "${DOWNLOAD_DIR}/.htpasswd" -m /=:$AUTH_USERNAME >/dev/null 2>&1 &
+        else
+            # 启动无认证的HTTPS服务器
+            uhttpd -p "$HTTPS_PORT" -h "$DOWNLOAD_DIR" -n 20 \
+                -T 30 -A 1 -N 100 -R -s "$SSL_CERT" -K "$SSL_KEY" >/dev/null 2>&1 &
+        fi
+        
+        local https_pid=$!
+        log "info" "HTTPS服务已启动 (PID: $https_pid)"
+    elif [ "$HTTPS_ENABLED" = "1" ]; then
+        log "error" "无法启动HTTPS服务：证书或密钥文件不存在"
+    fi
+    
+    return 0
+}
+
+# 主函数
+main() {
+    log "info" "==== IFLV 客户端下载服务启动 ===="
+    
+    # 检查锁文件
+    if ! check_lock; then
+        exit 1
+    fi
+    
+    # 获取配置
+    fetch_config
+    
+    # 检查更新版本
+    check_client_versions
+    
+    # 更新安装包
+    update_client_packages
+    
+    # 准备下载页面
+    prepare_download_page
+    
+    # 启动HTTP服务
+    start_http_server
+    
+    log "info" "下载服务初始化完成"
+    
+    # 保持脚本运行，并定期检查更新
+    while true; do
+        # 每隔12小时检查一次更新
+        sleep 43200
+        
+        log "info" "定期检查客户端更新"
+        check_client_versions
+        update_client_packages
+        
+        # 更新下载页面的版本信息
+        cp "$VERSION_INFO_FILE" "$DOWNLOAD_DIR/versions.json"
+    done
+}
+
+# 根据参数执行不同操作
+case "$1" in
+    start)
+        # 后台启动服务
+        "$0" start_daemon &
+        ;;
+    start_daemon)
+        # 直接启动（用于后台模式）
+        main
+        ;;
+    stop)
+        # 停止服务
+        if [ -f "$PID_FILE" ]; then
+            PID=$(cat "$PID_FILE")
+            if kill -0 $PID 2>/dev/null; then
+                log "info" "停止下载服务 (PID: $PID)"
+                kill $PID
+                rm -f "$PID_FILE"
+            else
+                log "warn" "下载服务未运行或已异常终止"
+                rm -f "$PID_FILE"
+            fi
+        else
+            log "warn" "未找到PID文件，下载服务可能未运行"
+        fi
+        
+        # 尝试杀死所有相关uhttpd进程
+        pkill -f "uhttpd.*$DOWNLOAD_DIR" 2>/dev/null
+        ;;
+    restart)
+        # 重启服务
+        "$0" stop
+        sleep 2
+        "$0" start
+        ;;
+    status)
+        # 查询状态
+        if [ -f "$PID_FILE" ]; then
+            PID=$(cat "$PID_FILE")
+            if kill -0 $PID 2>/dev/null; then
+                log "info" "下载服务正在运行 (PID: $PID)"
+                
+                # 检查HTTP端口
+                if netstat -tln | grep -q ":$DOWNLOAD_PORT "; then
+                    log "info" "HTTP服务(端口:$DOWNLOAD_PORT)正常运行"
+                else
+                    log "warn" "HTTP服务(端口:$DOWNLOAD_PORT)不可用"
+                fi
+                
+                # 检查HTTPS端口（如果启用）
+                if [ "$HTTPS_ENABLED" = "1" ]; then
+                    if netstat -tln | grep -q ":$HTTPS_PORT "; then
+                        log "info" "HTTPS服务(端口:$HTTPS_PORT)正常运行"
+                    else
+                        log "warn" "HTTPS服务(端口:$HTTPS_PORT)不可用"
+                    fi
+                fi
+                
+                exit 0
+            else
+                log "warn" "下载服务已异常终止"
+                rm -f "$PID_FILE"
+                exit 1
+            fi
+        else
+            log "warn" "下载服务未运行"
+            exit 1
+        fi
+        ;;
+    *)
+        # 直接运行服务（前台模式）
+        main
+        ;;
+esac
+
+exit 0 

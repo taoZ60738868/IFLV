@@ -1,0 +1,316 @@
+#!/bin/sh
+
+# IFLV 版本更新公告脚本
+# 版本: 1.1.0
+# 功能: 获取、处理、显示IFLV版本更新公告
+#
+# 参考项目致谢:
+# - 版本更新机制参考: https://github.com/jiecai58/luci-app-store
+# - 通知系统集成参考: https://www.right.com.cn/FORUM/thread-8413979-1-1.html
+
+# 设置颜色输出
+COLOR_INFO='\033[0;32m'
+COLOR_WARN='\033[0;33m'
+COLOR_ERROR='\033[0;31m'
+COLOR_TITLE='\033[1;36m'
+COLOR_NC='\033[0m' # 无颜色
+
+# 常量定义
+ANNOUNCEMENT_DIR="/usr/share/iflv/announcements"
+CURRENT_ANN_FILE="${ANNOUNCEMENT_DIR}/current.json"
+HISTORY_DIR="${ANNOUNCEMENT_DIR}/history"
+TEMP_DIR="/tmp/iflv_announcement"
+LOG_FILE="/var/log/iflv.log"
+CONFIG_FILE="/etc/config/iflv"
+CHECK_INTERVAL=86400  # 默认24小时检查一次
+
+# 创建必要的目录
+mkdir -p $ANNOUNCEMENT_DIR
+mkdir -p $HISTORY_DIR
+mkdir -p $TEMP_DIR
+
+# 日志函数
+log() {
+    local level="$1"
+    local message="$2"
+    local color="$COLOR_NC"
+    
+    case "$level" in
+        "info") color="$COLOR_INFO" ;;
+        "warn") color="$COLOR_WARN" ;;
+        "error") color="$COLOR_ERROR" ;;
+    esac
+    
+    # 输出到控制台
+    echo -e "${color}[IFLV-公告] $(date '+%Y-%m-%d %H:%M:%S') $level: $message${COLOR_NC}"
+    
+    # 记录到日志文件
+    echo "[IFLV-公告] $(date '+%Y-%m-%d %H:%M:%S') $level: $message" >> "$LOG_FILE"
+}
+
+# 获取配置
+fetch_config() {
+    log "info" "读取公告配置信息"
+    
+    # 加载UCI配置
+    . /lib/functions.sh
+    config_load 'iflv'
+    
+    # 获取公告配置信息
+    local enabled
+    local check_interval
+    local announcement_url
+    
+    config_get enabled announcement enabled "1"
+    config_get check_interval announcement check_interval "24"
+    config_get announcement_url announcement url "https://iflv.io/api/announcements.json"
+    
+    if [ "$enabled" != "1" ]; then
+        log "info" "公告功能未启用"
+        exit 0
+    fi
+    
+    CHECK_INTERVAL=$((check_interval * 3600))
+    ANNOUNCEMENT_URL="$announcement_url"
+    
+    log "info" "公告配置: 检查间隔=${check_interval}小时, URL=${ANNOUNCEMENT_URL}"
+}
+
+# 检查是否需要更新
+check_update_needed() {
+    if [ ! -f "$CURRENT_ANN_FILE" ]; then
+        log "info" "没有找到当前公告文件，需要检查更新"
+        return 0
+    fi
+    
+    # 检查上次检查时间
+    local last_check_file="${ANNOUNCEMENT_DIR}/last_check"
+    if [ -f "$last_check_file" ]; then
+        local last_check=$(cat "$last_check_file")
+        local current_time=$(date +%s)
+        local diff=$((current_time - last_check))
+        
+        if [ $diff -lt $CHECK_INTERVAL ]; then
+            log "info" "距离上次检查不足$(($CHECK_INTERVAL / 3600))小时 ($(($diff / 3600))小时), 跳过更新"
+            return 1
+        fi
+    fi
+    
+    log "info" "开始检查版本公告更新"
+    return 0
+}
+
+# 下载公告
+download_announcement() {
+    log "info" "尝试从 $ANNOUNCEMENT_URL 下载公告"
+    local temp_file="${TEMP_DIR}/announcement.json"
+    
+    # 尝试使用wget下载
+    if command -v wget >/dev/null 2>&1; then
+        if wget -q --timeout=30 --tries=3 -O "$temp_file" "$ANNOUNCEMENT_URL"; then
+            log "info" "成功下载公告"
+        else
+            log "error" "使用wget下载公告失败"
+            return 1
+        fi
+    # 如果wget不可用，尝试使用curl
+    elif command -v curl >/dev/null 2>&1; then
+        if curl -s --connect-timeout 30 --retry 3 -o "$temp_file" "$ANNOUNCEMENT_URL"; then
+            log "info" "成功下载公告"
+        else
+            log "error" "使用curl下载公告失败"
+            return 1
+        fi
+    else
+        log "error" "未找到wget或curl命令，无法下载"
+        return 1
+    fi
+    
+    # 验证JSON格式
+    if ! grep -q "\"version\":" "$temp_file"; then
+        log "error" "下载的公告文件格式无效"
+        rm -f "$temp_file"
+        return 1
+    fi
+    
+    # 记录检查时间
+    date +%s > "${ANNOUNCEMENT_DIR}/last_check"
+    
+    # 比较版本号
+    local new_version=$(grep -o "\"version\":[^,]*" "$temp_file" | cut -d'"' -f4)
+    
+    if [ -f "$CURRENT_ANN_FILE" ]; then
+        local current_version=$(grep -o "\"version\":[^,]*" "$CURRENT_ANN_FILE" | cut -d'"' -f4)
+        
+        # 使用sort -V进行版本比较
+        if echo "$current_version $new_version" | tr ' ' '\n' | sort -V | tail -n1 | grep -q "^$current_version$"; then
+            log "info" "当前公告版本 $current_version 已是最新，无需更新"
+            rm -f "$temp_file"
+            return 2
+        fi
+        
+        # 备份当前公告到历史目录
+        cp "$CURRENT_ANN_FILE" "${HISTORY_DIR}/announcement_${current_version}.json"
+    fi
+    
+    # 更新当前公告
+    mv "$temp_file" "$CURRENT_ANN_FILE"
+    log "info" "公告已更新到版本 $new_version"
+    
+    # 发送系统通知（如果可用）
+    if command -v ubus >/dev/null 2>&1; then
+        ubus call system notify "{'title':'IFLV版本更新公告', 'text':'发现新的IFLV公告(v$new_version)，请在LuCI界面查看详情'}"
+    fi
+    
+    return 0
+}
+
+# 显示当前公告
+show_announcement() {
+    if [ ! -f "$CURRENT_ANN_FILE" ]; then
+        echo "暂无公告信息"
+        return 1
+    fi
+    
+    local version=$(grep -o "\"version\":[^,]*" "$CURRENT_ANN_FILE" | cut -d'"' -f4)
+    local title=$(grep -o "\"title\":[^,]*" "$CURRENT_ANN_FILE" | cut -d'"' -f4)
+    local date=$(grep -o "\"date\":[^,]*" "$CURRENT_ANN_FILE" | cut -d'"' -f4)
+    
+    echo -e "${COLOR_TITLE}IFLV 版本公告 (v$version)${COLOR_NC}"
+    echo -e "${COLOR_TITLE}$title${COLOR_NC}"
+    echo -e "发布日期: $date"
+    echo -e "----------------------------------------"
+    
+    # 提取内容部分并显示
+    sed -n '/"content":/,/^}/p' "$CURRENT_ANN_FILE" | \
+        grep -v "\"content\":" | grep -v "^}" | \
+        sed 's/^ *"//g' | sed 's/",*$//g' | sed 's/\\n/\n/g'
+    
+    echo -e "----------------------------------------"
+}
+
+# 列出历史公告
+list_history() {
+    local history_files=$(find "$HISTORY_DIR" -name "announcement_*.json" | sort -r)
+    
+    if [ -z "$history_files" ]; then
+        echo "暂无历史公告记录"
+        return 1
+    fi
+    
+    echo -e "${COLOR_TITLE}IFLV 历史公告列表${COLOR_NC}"
+    echo -e "----------------------------------------"
+    
+    for file in $history_files; do
+        local version=$(grep -o "\"version\":[^,]*" "$file" | cut -d'"' -f4)
+        local title=$(grep -o "\"title\":[^,]*" "$file" | cut -d'"' -f4)
+        local date=$(grep -o "\"date\":[^,]*" "$file" | cut -d'"' -f4)
+        
+        echo -e "版本: $version"
+        echo -e "标题: $title"
+        echo -e "日期: $date"
+        echo -e "----------------------------------------"
+    done
+}
+
+# 显示指定版本的公告
+show_history() {
+    local version="$1"
+    local file="${HISTORY_DIR}/announcement_${version}.json"
+    
+    if [ ! -f "$file" ]; then
+        echo "未找到版本 $version 的公告记录"
+        return 1
+    fi
+    
+    local title=$(grep -o "\"title\":[^,]*" "$file" | cut -d'"' -f4)
+    local date=$(grep -o "\"date\":[^,]*" "$file" | cut -d'"' -f4)
+    
+    echo -e "${COLOR_TITLE}IFLV 历史公告 (v$version)${COLOR_NC}"
+    echo -e "${COLOR_TITLE}$title${COLOR_NC}"
+    echo -e "发布日期: $date"
+    echo -e "----------------------------------------"
+    
+    # 提取内容部分并显示
+    sed -n '/"content":/,/^}/p' "$file" | \
+        grep -v "\"content\":" | grep -v "^}" | \
+        sed 's/^ *"//g' | sed 's/",*$//g' | sed 's/\\n/\n/g'
+    
+    echo -e "----------------------------------------"
+}
+
+# 生成本地公告（用于本地开发或测试）
+generate_local_announcement() {
+    local version="$1"
+    local title="$2"
+    
+    if [ -z "$version" ] || [ -z "$title" ]; then
+        echo "用法: $0 generate <版本> <标题>"
+        return 1
+    fi
+    
+    local content_file="${TEMP_DIR}/content.txt"
+    
+    # 提示用户输入内容
+    echo "请输入公告内容（输入 EOF 结束）:"
+    cat > "$content_file"
+    
+    # 格式化内容
+    local content=$(sed 's/EOF$//' "$content_file" | sed ':a;N;$!ba;s/\n/\\n/g' | sed 's/"/\\"/g')
+    
+    # 创建公告JSON
+    cat > "$CURRENT_ANN_FILE" << EOF
+{
+  "version": "$version",
+  "title": "$title",
+  "date": "$(date '+%Y-%m-%d')",
+  "content": [
+    "$content"
+  ]
+}
+EOF
+    
+    log "info" "已生成本地公告 v$version: $title"
+    rm -f "$content_file"
+    
+    echo "本地公告已生成:"
+    show_announcement
+}
+
+# 主函数
+main() {
+    local action="$1"
+    local param="$2"
+    
+    case "$action" in
+        check|update)
+            fetch_config
+            if check_update_needed; then
+                download_announcement
+            fi
+            ;;
+        show|current)
+            show_announcement
+            ;;
+        list|history)
+            list_history
+            ;;
+        view)
+            show_history "$param"
+            ;;
+        generate)
+            generate_local_announcement "$param" "$3"
+            ;;
+        *)
+            echo "用法: $0 <命令> [参数]"
+            echo "命令:"
+            echo "  check, update    检查并更新公告"
+            echo "  show, current    显示当前公告"
+            echo "  list, history    列出历史公告"
+            echo "  view <版本>      查看指定版本的历史公告"
+            echo "  generate <版本> <标题>  生成本地公告(开发用)"
+            ;;
+    esac
+}
+
+main "$@" 

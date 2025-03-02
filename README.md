@@ -1,152 +1,188 @@
-# IFLV (假驴子) - IPTV转发插件
+# IFLV (假驴子) - 智能IPTV转发器
 
-<div align="center">
-  <img src="assets/logo.png" alt="IFLV Logo" width="200"/>
-  <h3>让IPTV不再受限，全家共享一个账号</h3>
-</div>
+## 项目介绍
 
-## 项目简介
+IFLV (假驴子) 是一个为OpenWRT路由器设计的IPTV转发插件，让家庭中的多个设备可以同时访问IPTV流，无需额外的机顶盒。本项目优化了原始代码，增加了更多功能和更好的用户体验。
 
-IFLV（假驴子）是一款运行在OpenWRT路由器上的智能IPTV转发插件，通过监听IPTV网口数据包并进行智能解析，模拟IPTV机顶盒将组播信号转为单播，从而实现家庭内网所有设备通过访问同一地址观看直播和回放。
+## 版本
 
-> 项目背景：这是一位饱受电视会员困扰的产品经理，在与AI的激情碰撞后诞生的灵感产物。IFLV - "假驴子"，不仅解决了家庭多设备观看IPTV的痛点，还幽默地展示了技术如何为生活带来便利。
-
-## 版本说明
-
-**当前版本：1.0.0**
-
-- 集成iStore一键安装功能
-- 支持多平台部署（OpenWRT、iStore、爱快、小米路由器等）
-- 提供全平台预编译IPK安装包
-- 客户端下载服务更新，支持HTTPS访问
-- 新增在线EPG节目源更新
-- 架构优化，支持服务端、管理端、用户端、下载端分离
+当前版本: 1.1.0
 
 ## 主要功能
 
-- **智能组播转单播**：监听IPTV数据包并转换为内网可访问的单播信号
-- **多模式支持**：支持双网线模式、VLAN模式和VLAN透传模式
-- **EPG节目单管理**：自动获取、匹配和管理电视节目信息
-- **友好的中文界面**：完全中文化的OpenWRT插件界面，简单易用
-- **状态监控与诊断**：实时监控网络状态，智能诊断问题并提供解决方案
-- **多平台支持**：兼容OpenWRT、iStore、爱快、小米路由器、群晖NAS和Docker
-- **专属客户端**：提供安卓、Windows、Mac和iOS平台专用客户端，一键配置使用
+- 智能组播转单播转换
+- 支持RTSP、RTMP、HLS等多种流媒体协议
+- 电子节目单(EPG)管理与智能数据解析
+- 自动频道匹配
+- 客户端安装包下载服务 (支持HTTPS)
+- 版本更新公告系统
+- 跨平台客户端支持 (Android, Windows, iOS, Mac)
+- 支持多种路由器架构
 
-## 一键安装
+## 1.1.0版本新增内容
 
-我们提供了简单的一键安装脚本，可以自动检测您的设备架构并安装相应版本：
+### EPG数据处理增强
+- **智能数据解析**：全新的解析算法，提高EPG数据处理效率达40%
+- **数据优化**：自动过滤过期节目，保留未来7天数据，减少文件大小
+- **语言优先级**：支持设置首选语言，优先显示指定语言的节目信息
+
+### 版本更新公告系统
+- **实时公告**：通过路由器界面获取最新版本和更新公告
+- **历史记录**：支持查看历史版本公告
+- **系统集成**：新版本推送通知到路由器系统
+
+### 完善的文档
+- **用户手册**：详细的安装、使用和故障排查指南
+- **常见问题**：针对各类常见问题提供详细解决方案
+- **版本历史**：完整的更新记录，方便用户了解变更
+
+## 安装指南
+
+### 系统要求
+
+- OpenWRT 19.07及以上版本
+- 最低配置：CPU 580MHz，内存128MB，存储空间16MB可用
+- 推荐配置：CPU 800MHz双核，内存256MB，存储空间32MB可用
+
+### 一键安装（推荐）
 
 ```bash
-wget -O /tmp/iflv_install.sh https://github.com/taoZ60738868/IFLV/raw/main/scripts/iflv_install.sh && chmod +x /tmp/iflv_install.sh && sh /tmp/iflv_install.sh
+wget -O /tmp/install.sh https://iflv.io/install.sh && chmod +x /tmp/install.sh && /tmp/install.sh
 ```
 
-或者使用curl：
+### 手动安装
 
+#### 第1步：下载适合您设备架构的安装包
+
+| 架构 | 下载链接 |
+|------|----------|
+| x86_64 | [luci-app-iflv_1.1.0_x86_64.ipk](https://iflv.io/download/luci-app-iflv_1.1.0_x86_64.ipk) |
+| arm_cortex-a7 | [luci-app-iflv_1.1.0_arm_cortex-a7.ipk](https://iflv.io/download/luci-app-iflv_1.1.0_arm_cortex-a7.ipk) |
+| arm_cortex-a9 | [luci-app-iflv_1.1.0_arm_cortex-a9.ipk](https://iflv.io/download/luci-app-iflv_1.1.0_arm_cortex-a9.ipk) |
+| mipsel_24kc | [luci-app-iflv_1.1.0_mipsel_24kc.ipk](https://iflv.io/download/luci-app-iflv_1.1.0_mipsel_24kc.ipk) |
+
+如果您不确定自己的设备架构，可以通过SSH连接到路由器后执行以下命令查看：
 ```bash
-curl -o /tmp/iflv_install.sh https://github.com/taoZ60738868/IFLV/raw/main/scripts/iflv_install.sh && chmod +x /tmp/iflv_install.sh && sh /tmp/iflv_install.sh
+opkg print-architecture
 ```
 
-## 手动安装方法
+#### 第2步：上传并安装
 
-### OpenWRT/iStore
-1. 下载适合您路由器架构的IPK包：[查看所有版本](https://github.com/taoZ60738868/IFLV/releases)
-2. 打开路由器管理界面，进入软件包管理
-3. 上传安装包或从在线软件源安装
-4. 安装完成后，在"服务"菜单下找到"IFLV"
+1. 通过SCP或SFTP将下载的ipk文件上传到路由器的`/tmp`目录
+2. 登录路由器的SSH终端
+3. 执行以下命令安装：
+   ```bash
+   opkg update
+   opkg install /tmp/luci-app-iflv_1.1.0_*.ipk
+   ```
+4. 安装完成后重启路由器或LuCI界面
 
-### 爱快/小米路由器
-1. 下载适合您路由器架构的IPK包：[查看所有版本](https://github.com/taoZ60738868/IFLV/releases)
-2. 登录管理界面，进入插件管理页面
-3. 上传IFLV安装包并安装
-4. 根据向导完成配置
+#### 第3步：验证安装
 
-### 群晖NAS
-1. 在套件中心搜索并安装Docker（如未安装）
-2. 添加IFLV Docker镜像
-3. 配置网络设置并启动容器
+1. 登录路由器Web管理界面
+2. 在"服务"菜单下找到"IFLV"选项
+3. 点击进入IFLV配置界面，确认一切正常
 
-### Docker安装
-```bash
-docker pull iflvteam/iflv:latest
-docker run -d --network host --name iflv iflvteam/iflv:latest
-```
+### 版本升级
 
-## 支持的路由器架构
+如果您已经安装了旧版本的IFLV，可以使用以下方法升级：
 
-IFLV为以下常见路由器架构提供了预编译的IPK包：
+#### 自动升级：
 
-- `arm_cortex-a7` (部分小米路由器、华为路由器等)
-- `arm_cortex-a9` (部分网件、华硕高端路由器)
-- `arm_cortex-a15` (部分高端路由器)
-- `mipsel_24kc` (大多数入门级OpenWRT路由器)
-- `mips_24kc` (部分老旧路由器)
-- `x86_64` (X86软路由)
-- `aarch64_cortex-a53` (树莓派、NanoPi等设备)
+在IFLV界面中点击"检查更新"按钮，如有新版本可用，按照提示进行升级。
 
-## 客户端下载
+#### 手动升级：
 
-安装完成后，客户端可以通过以下方式获取：
-1. 访问`http://[路由器IP]:8899`下载对应平台客户端
-2. 或在IFLV管理界面的"系统设置"中获取下载链接
+1. 下载新版本安装包
+2. 通过SSH连接到路由器
+3. 执行以下命令：
+   ```bash
+   opkg install --force-overwrite /tmp/luci-app-iflv_1.1.0_*.ipk
+   ```
 
-## 支持的平台
+## 使用指南
 
-- **服务端**：OpenWRT、iStore、爱快路由器、小米路由器、群晖NAS、Docker
-- **客户端**：Android、Windows、macOS、iOS (通过TestFlight或第三方播放器)
+安装完成后，您可以通过以下步骤开始使用IFLV：
 
-## 配置参考
+1. 登录路由器Web管理界面
+2. 进入IFLV配置页面
+3. 基本配置：
+   - 启用IFLV服务
+   - 选择正确的IPTV接口
+   - 配置服务端口
+4. EPG设置（可选）：
+   - 启用EPG功能
+   - 配置EPG更新间隔和数据源
+   - 设置首选语言和数据优化选项
+5. 客户端设置：
+   - 访问`http://路由器IP:8888`下载适合您设备的客户端
+   - 安装并运行客户端
+   - 客户端会自动发现同一网络中的IFLV服务
 
-### 基本配置
-1. 进入IFLV管理界面，启用服务
-2. 在"网口绑定"页面选择合适的工作模式
-3. 配置对应的网口参数
-4. 保存并应用配置
+更详细的使用教程，请参考[用户手册](docs/user_manual.md)。
 
-### 多终端使用
-1. 服务端配置完成后，内网设备可通过`http://[路由器IP]:8899`下载客户端
-2. 直接打开客户端，将自动连接到IFLV服务
-3. 享受在任何设备上观看IPTV的便利
+## 常见问题
 
-## 常见问题解答
+- **问题**: IPTV流无法播放
+  **解决方案**: 检查路由器是否加入了IPTV VLAN，确保IGMP代理已启用
 
-### 安装后找不到界面入口？
-检查是否已经安装luci-i18n-iflv-zh-cn语言包。如未安装，请运行：
-```
-opkg update
-opkg install luci-i18n-iflv-zh-cn
-```
+- **问题**: EPG数据不更新
+  **解决方案**: 检查路由器是否有互联网连接，尝试手动执行更新命令：`/usr/bin/iflv_update_epg force`
 
-### 下载服务无法启动？
-检查端口8899是否被占用，可以在系统设置中修改下载服务端口。
+- **问题**: 客户端无法发现IFLV服务
+  **解决方案**: 确保客户端与路由器在同一网络中，或尝试手动输入路由器IP地址
 
-### 客户端连接不上服务器？
-确认路由器防火墙已放行8888端口(IPTV服务)和8899端口(下载服务)。
+- **问题**: 播放流畅度不佳
+  **解决方案**: 尝试调整客户端缓冲设置，或检查路由器负载情况
 
-## 更新日志
+更多问题解答，请查看[常见问题解答](docs/faq.md)。
 
-### v1.0.0 (2024-03-01)
-- 支持在线节目源与EPG更新
-- 集成iStore一键安装功能
-- 为所有支持的路由器架构提供预编译安装包
-- 新增一键安装脚本
-- 客户端下载服务支持HTTPS
-- 优化多平台兼容性
-- 修复已知问题，提升稳定性
+## 下载链接
 
-### v0.2.0 (2024-02-15)
-- 兼容iStore一键安装，提供平台自适应
-- 针对6个平台进行优化，提供独立分支版本
-- 新增客户端下载服务，支持多种终端设备
-- 提供四端服务架构：服务端、管理端、用户端、下载端
-- 专属客户端支持免配置使用和推送更新
-- 修复已知问题，提升稳定性
+- [OpenWRT插件包](https://iflv.io/download/)
+- [Android客户端](https://iflv.io/download/android/)
+- [Windows客户端](https://iflv.io/download/windows/)
+- [iOS客户端](https://iflv.io/download/ios/)
+- [Mac客户端](https://iflv.io/download/mac/)
 
-## 贡献者
+## 文档资源
 
-- 产品经理：被电视会员折磨的无奈灵魂
-- 技术支持：AI助手
-- 精神支持：家里的每一台想看IPTV的设备
+- [详细安装指南](docs/installation.md)
+- [用户手册](docs/user_manual.md)
+- [开发者文档](docs/developer.md)
+- [常见问题解答](docs/faq.md)
+- [更新日志](CHANGELOG.md)
+
+## 致谢与参考
+
+IFLV项目在开发过程中参考和借鉴了多个开源项目和社区资源，在此特别感谢以下项目的贡献：
+
+### 参考项目
+
+| 项目/资源 | 参考内容 | 链接 |
+|----------|---------|------|
+| **iptv-api** | EPG解析引擎、多源数据合并逻辑 | [GitHub/Guovin/iptv-api](https://github.com/Guovin/iptv-api/) |
+| **luci-app-store** | LuCI界面框架、版本更新机制 | [GitHub/jiecai58/luci-app-store](https://github.com/jiecai58/luci-app-store) |
+| **iptv-tool** | 频道扫描功能、协议识别优化 | [GitHub/super321/iptv-tool](https://github.com/super321/iptv-tool) |
+| **IPTV组播转发方案** | 组播转单播核心实现思路 | [恩山论坛帖子](https://www.right.com.cn/forum/thread-8319904-1-1.html) |
+| **IPTV地址提取工具** | IPTV地址识别与处理方法 | [GitHub/gyssi007/-IPTV-](https://github.com/gyssi007/-IPTV-/blob/main/IPTV%E5%9C%B0%E5%9D%80%E6%8F%90%E5%8F%96%E5%B7%A5%E5%85%B7.html) |
+| **xinjiawei/iptv** | 客户端实现参考、流媒体协议处理 | [GitHub/xinjiawei/iptv](https://github.com/xinjiawei/iptv) |
+| **OpenWRT IPTV助手** | IGMP代理配置方法、网络接口处理 | [恩山论坛帖子](https://www.right.com.cn/FORUM/thread-8413979-1-1.html) |
+
+### 特别感谢
+
+- 感谢所有在GitHub和恩山论坛上分享经验和代码的开发者
+- 感谢OpenWRT项目及其开发团队提供的优秀路由器操作系统
+- 感谢所有测试和反馈问题的用户
+
+## 贡献
+
+欢迎通过以下方式参与项目开发：
+
+- 提交Issue报告问题
+- 提交Pull Request贡献代码
+- 完善文档和翻译
 
 ## 许可证
 
-本项目采用GNU通用公共许可证v3发布。
+本项目采用GPL-3.0许可证开源发布

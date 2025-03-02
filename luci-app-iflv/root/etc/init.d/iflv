@@ -1,70 +1,354 @@
 #!/bin/sh /etc/rc.common
+# Copyright (C) 2023-2024 IFLV Team
+# Licensed under the GPL v3 License.
 
-START=99
-STOP=10
-
+START=95
+STOP=15
 USE_PROCD=1
+
 PROG=/usr/bin/iflv
+PROG_EPG=/usr/bin/iflv_update_epg
+CONF=/etc/config/iflv
+CHANNELS=/usr/share/iflv/channels.json
+EPG_DIR=/usr/share/iflv/epg
+LOG_FILE=/var/log/iflv.log
+DOWNLOAD_SERVER_PID=/var/run/iflv_download.pid
 
-get_config() {
-	config_get_bool enabled $1 enabled 0
-	config_get work_mode $1 work_mode 'dual_line'
-	config_get iptv_provider $1 iptv_provider 'china_telecom'
-	config_get iptv_region $1 iptv_region 'shanghai'
+# 颜色输出
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # 无颜色
+
+# 日志函数
+log() {
+    local level="$1"
+    local message="$2"
+    local color="$NC"
+    
+    case "$level" in
+        "info") color="$GREEN" ;;
+        "warn") color="$YELLOW" ;;
+        "error") color="$RED" ;;
+        "debug") color="$BLUE" ;;
+    esac
+    
+    # 输出到控制台
+    echo -e "${color}[IFLV-Init] $(date '+%Y-%m-%d %H:%M:%S') $level: $message${NC}"
+    
+    # 记录到日志文件
+    echo "[IFLV-Init] $(date '+%Y-%m-%d %H:%M:%S') $level: $message" >> "$LOG_FILE"
 }
 
-get_interface() {
-	config_get modem_port $1 modem_port
-	config_get stb_port $1 stb_port
-	config_get vlan_id $1 vlan_id
-	config_get inner_vlan_id $1 inner_vlan_id
+init_env() {
+    # 确保目录存在
+    mkdir -p /usr/share/iflv
+    mkdir -p /usr/share/iflv/epg
+    mkdir -p /usr/share/iflv/downloads
+    mkdir -p /usr/share/iflv/clients
+    
+    # 确保日志文件存在
+    touch "$LOG_FILE"
+    
+    # 如果配置文件不存在，创建默认配置
+    if [ ! -f "$CONF" ]; then
+        touch "$CONF"
+        
+        # 创建默认配置
+        uci -q batch <<-EOF >/dev/null
+            set iflv.globals=globals
+            set iflv.globals.enabled='1'
+            set iflv.globals.work_mode='double'
+            set iflv.globals.version='1.0.0'
+            
+            add iflv interface
+            set iflv.@interface[-1].wan_if='eth1'
+            set iflv.@interface[-1].lan_if='br-lan'
+            
+            add iflv vlan_config
+            set iflv.@vlan_config[-1].vlan_id='85'
+            set iflv.@vlan_config[-1].inner_vlan_id='10'
+            
+            add iflv service
+            set iflv.@service[-1].port='8888'
+            set iflv.@service[-1].buffer_size='8192'
+            set iflv.@service[-1].cache_time='300'
+            
+            add iflv download
+            set iflv.@download[-1].enabled='1'
+            set iflv.@download[-1].port='8899'
+            
+            add iflv epg
+            set iflv.@epg[-1].enabled='1'
+            set iflv.@epg[-1].update_interval='24'
+            set iflv.@epg[-1].sources='http://epg.51zmt.top:8000/e.xml|https://epg.112114.xyz/e.xml'
+            set iflv.@epg[-1].cache_days='7'
+            
+            commit iflv
+EOF
+        log "info" "已创建默认配置文件"
+    fi
+    
+    # 初始化状态数据文件
+    if [ ! -f "/usr/share/iflv/status_data.json" ]; then
+        cat > "/usr/share/iflv/status_data.json" << EOF
+{
+  "status": "stopped",
+  "last_start": "",
+  "channels_count": 0,
+  "active_connections": 0,
+  "download_server": "stopped",
+  "epg_last_update": ""
 }
-
-get_system() {
-	config_get log_level $1 log_level 'info'
-	config_get_bool auto_start $1 auto_start 1
-	config_get_bool auto_analyze $1 auto_analyze 1
+EOF
+    fi
 }
 
 start_service() {
-	config_load iflv
-	config_foreach get_config globals
-	config_foreach get_interface interface
-	config_foreach get_system system
-	
-	[ "$enabled" = "0" ] && return 1
-	
-	procd_open_instance
-	procd_set_param command $PROG
-	procd_append_param command --work-mode "$work_mode"
-	procd_append_param command --modem-port "$modem_port"
-	procd_append_param command --stb-port "$stb_port"
-	
-	if [ "$work_mode" = "vlan" ] || [ "$work_mode" = "vlan_passthrough" ]; then
-		procd_append_param command --vlan-id "$vlan_id"
-	fi
-	
-	if [ "$work_mode" = "vlan_passthrough" ]; then
-		procd_append_param command --inner-vlan-id "$inner_vlan_id"
-	fi
-	
-	procd_append_param command --provider "$iptv_provider"
-	procd_append_param command --region "$iptv_region"
-	procd_append_param command --log-level "$log_level"
-	
-	[ "$auto_analyze" = "1" ] && procd_append_param command --auto-analyze
-	
-	procd_set_param respawn
-	procd_set_param stdout 1
-	procd_set_param stderr 1
-	procd_close_instance
+    init_env
+    
+    # 读取配置
+    local enabled
+    local work_mode
+    local wan_if
+    local lan_if
+    local port
+    
+    config_load 'iflv'
+    
+    config_get enabled globals enabled '1'
+    config_get work_mode globals work_mode 'double'
+    
+    config_get wan_if interface wan_if 'eth1'
+    config_get lan_if interface lan_if 'br-lan'
+    
+    config_get port service port '8888'
+    config_get buffer_size service buffer_size '8192'
+    config_get cache_time service cache_time '300'
+    
+    if [ "$enabled" != "1" ]; then
+        log "info" "IFLV服务已禁用，不启动"
+        return 0
+    fi
+    
+    log "info" "开始启动IFLV服务"
+    
+    # 检查所需的网络接口
+    check_network_interfaces "$work_mode" "$wan_if" "$lan_if"
+    
+    # 基于工作模式构建命令行参数
+    local cmd_args="--daemon --mode $work_mode --port $port --buffer-size $buffer_size --cache-time $cache_time"
+    
+    if [ "$work_mode" = "double" ]; then
+        cmd_args="$cmd_args --wan-if $wan_if --lan-if $lan_if"
+    elif [ "$work_mode" = "vlan" ] || [ "$work_mode" = "passthrough" ]; then
+        cmd_args="$cmd_args --lan-if $lan_if"
+    fi
+    
+    # 使用procd启动服务
+    procd_open_instance
+    procd_set_param command "$PROG" $cmd_args
+    procd_set_param stdout 1
+    procd_set_param stderr 1
+    procd_set_param respawn "${respawn_threshold:-3600}" "${respawn_timeout:-5}" "${respawn_retry:-5}"
+    procd_close_instance
+    
+    # 启动下载服务（如果启用）
+    start_download_server
+    
+    # 设置EPG自动更新
+    setup_epg_updates
+    
+    # 更新状态数据
+    update_status_data "running" "$(date '+%Y-%m-%d %H:%M:%S')"
+    
+    log "info" "IFLV服务启动完成"
 }
 
-service_triggers() {
-	procd_add_reload_trigger "iflv"
+stop_service() {
+    log "info" "停止IFLV服务"
+    
+    # 使用procd停止服务（会自动停止主服务）
+    
+    # 停止下载服务
+    stop_download_server
+    
+    # 移除EPG更新
+    remove_epg_updates
+    
+    # 更新状态数据
+    update_status_data "stopped" ""
+    
+    log "info" "IFLV服务已停止"
 }
 
 reload_service() {
-	stop
-	start
+    log "info" "重载IFLV服务"
+    stop
+    start
+}
+
+start_download_server() {
+    local enabled
+    local port
+    
+    config_get enabled download enabled '1'
+    config_get port download port '8899'
+    
+    if [ "$enabled" != "1" ]; then
+        log "info" "下载服务已禁用，不启动"
+        return 0
+    fi
+    
+    # 检查下载服务是否已经运行
+    if [ -f "$DOWNLOAD_SERVER_PID" ]; then
+        local pid=$(cat "$DOWNLOAD_SERVER_PID")
+        if kill -0 "$pid" 2>/dev/null; then
+            log "info" "下载服务已在运行 (PID: $pid)"
+            return 0
+        fi
+    fi
+    
+    log "info" "启动下载服务，端口: $port"
+    "$PROG" start_download --port "$port"
+    
+    # 更新状态数据
+    update_status_data_field "download_server" "running"
+}
+
+stop_download_server() {
+    log "info" "停止下载服务"
+    "$PROG" stop_download
+    
+    # 更新状态数据
+    update_status_data_field "download_server" "stopped"
+}
+
+setup_epg_updates() {
+    local enabled
+    local update_interval
+    
+    config_get enabled epg enabled '1'
+    config_get update_interval epg update_interval '24'
+    
+    if [ "$enabled" != "1" ]; then
+        log "info" "EPG功能已禁用，不设置自动更新"
+        return 0
+    fi
+    
+    # 确保cron已安装
+    if ! command -v crontab >/dev/null 2>&1; then
+        log "warn" "crontab命令不可用，无法设置EPG自动更新"
+        return 1
+    fi
+    
+    log "info" "设置EPG自动更新，间隔: $update_interval 小时"
+    
+    # 移除旧的cron任务
+    crontab -l 2>/dev/null | grep -v "iflv_update_epg" | crontab -
+    
+    # 添加新的cron任务
+    # 随机分钟数，避免所有设备同时更新
+    local random_minute=$((RANDOM % 60))
+    (crontab -l 2>/dev/null; echo "$random_minute */$update_interval * * * $PROG_EPG") | crontab -
+    
+    # 如果EPG文件不存在，立即执行一次更新
+    if [ ! -f "$EPG_DIR/epg.xml" ]; then
+        log "info" "EPG文件不存在，立即执行一次更新"
+        "$PROG_EPG"
+    fi
+}
+
+remove_epg_updates() {
+    log "info" "移除EPG自动更新"
+    
+    # 确保cron已安装
+    if command -v crontab >/dev/null 2>&1; then
+        # 移除cron任务
+        crontab -l 2>/dev/null | grep -v "iflv_update_epg" | crontab -
+    fi
+}
+
+check_network_interfaces() {
+    local mode="$1"
+    local wan_if="$2"
+    local lan_if="$3"
+    
+    # 检查LAN接口
+    if ! ip link show "$lan_if" >/dev/null 2>&1; then
+        log "warn" "LAN接口 $lan_if 不存在，将尝试使用默认接口"
+        # 尝试获取默认LAN接口
+        local default_lan=$(ip route | grep default | awk '{print $5}')
+        if [ -n "$default_lan" ]; then
+            log "info" "使用默认LAN接口: $default_lan"
+            uci set iflv.@interface[0].lan_if="$default_lan"
+            uci commit iflv
+        else
+            log "error" "无法找到可用的LAN接口"
+        fi
+    fi
+    
+    # 如果是双网线模式，检查WAN接口
+    if [ "$mode" = "double" ]; then
+        if ! ip link show "$wan_if" >/dev/null 2>&1; then
+            log "warn" "WAN接口 $wan_if 不存在，将尝试自动检测IPTV接口"
+            # 这里可以实现一个算法来自动检测IPTV接口
+            # 如：遍历所有网络接口，查找是否有接收到组播流量
+            # 这里简化处理，仅记录警告
+        fi
+    fi
+}
+
+update_status_data() {
+    local status="$1"
+    local start_time="$2"
+    
+    # 获取当前状态数据
+    local status_file="/usr/share/iflv/status_data.json"
+    local temp_file="/tmp/iflv_status_temp.json"
+    
+    # 读取频道数量
+    local channels_count=0
+    if [ -f "$CHANNELS" ]; then
+        channels_count=$(grep -o '"id"' "$CHANNELS" 2>/dev/null | wc -l)
+    fi
+    
+    # 获取EPG最后更新时间
+    local epg_last_update
+    config_get epg_last_update epg last_update ""
+    
+    # 创建新的状态数据
+    cat > "$temp_file" << EOF
+{
+  "status": "$status",
+  "last_start": "$start_time",
+  "channels_count": $channels_count,
+  "active_connections": 0,
+  "download_server": "$([ -f "$DOWNLOAD_SERVER_PID" ] && echo "running" || echo "stopped")",
+  "epg_last_update": "$epg_last_update"
+}
+EOF
+    
+    # 更新状态文件
+    mv "$temp_file" "$status_file"
+}
+
+update_status_data_field() {
+    local field="$1"
+    local value="$2"
+    
+    # 获取当前状态数据
+    local status_file="/usr/share/iflv/status_data.json"
+    local temp_file="/tmp/iflv_status_temp.json"
+    
+    # 使用sed更新字段
+    if [ -f "$status_file" ]; then
+        sed "s/\"$field\"[[:space:]]*:[[:space:]]*\"[^\"]*\"/\"$field\": \"$value\"/" "$status_file" > "$temp_file"
+        mv "$temp_file" "$status_file"
+    fi
+}
+
+service_triggers() {
+    procd_add_reload_trigger "iflv"
 } 

@@ -1,0 +1,79 @@
+#!/bin/sh
+
+# IFLV 防火墙规则
+# 用于确保IPTV流量和服务端口能够正常通过防火墙
+
+# 加载配置文件
+. /lib/functions.sh
+config_load 'iflv'
+
+# 获取配置
+config_get ENABLED globals enabled '1'
+config_get WORK_MODE globals work_mode 'double'
+config_get PORT service port '8888'
+config_get DOWNLOAD_PORT download port '8899'
+
+# 如果服务未启用，则不添加规则
+if [ "$ENABLED" != "1" ]; then
+    exit 0
+fi
+
+# 添加IFLV服务端口到防火墙允许列表
+iptables -t filter -I INPUT -p tcp --dport $PORT -j ACCEPT 2>/dev/null
+iptables -t filter -I INPUT -p udp --dport $PORT -j ACCEPT 2>/dev/null
+
+# 添加IFLV下载服务端口到防火墙允许列表
+iptables -t filter -I INPUT -p tcp --dport $DOWNLOAD_PORT -j ACCEPT 2>/dev/null
+
+# 允许IGMP协议通过（组播管理协议）
+iptables -t filter -I INPUT -p igmp -j ACCEPT 2>/dev/null
+iptables -t filter -I OUTPUT -p igmp -j ACCEPT 2>/dev/null
+iptables -t filter -I FORWARD -p igmp -j ACCEPT 2>/dev/null
+
+# 允许组播地址段的UDP流量
+iptables -t filter -I INPUT -p udp -d 224.0.0.0/4 -j ACCEPT 2>/dev/null
+iptables -t filter -I OUTPUT -p udp -d 224.0.0.0/4 -j ACCEPT 2>/dev/null
+iptables -t filter -I FORWARD -p udp -d 224.0.0.0/4 -j ACCEPT 2>/dev/null
+
+# 根据工作模式添加特定规则
+case "$WORK_MODE" in
+    double)
+        # 获取双网线模式的接口
+        config_get WAN_IF interface wan_if 'eth1'
+        config_get LAN_IF interface lan_if 'br-lan'
+        
+        # 允许WAN接口的IPTV流量
+        iptables -t filter -I FORWARD -i $WAN_IF -p udp -j ACCEPT 2>/dev/null
+        iptables -t filter -I FORWARD -o $WAN_IF -p udp -j ACCEPT 2>/dev/null
+        ;;
+    vlan)
+        # 获取VLAN模式的接口和VLAN ID
+        config_get LAN_IF interface lan_if 'br-lan'
+        config_get VLAN_ID vlan_config vlan_id '85'
+        
+        # 创建特定的VLAN规则（如果需要）
+        ;;
+    passthrough)
+        # 获取VLAN透传模式的接口和VLAN ID
+        config_get LAN_IF interface lan_if 'br-lan'
+        config_get VLAN_ID vlan_config vlan_id '85'
+        config_get INNER_VLAN_ID vlan_config inner_vlan_id '10'
+        
+        # 创建特定的VLAN透传规则（如果需要）
+        ;;
+esac
+
+# 对于IPv6环境，添加类似规则
+# 检查是否支持ip6tables
+if command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -t filter -I INPUT -p tcp --dport $PORT -j ACCEPT 2>/dev/null
+    ip6tables -t filter -I INPUT -p udp --dport $PORT -j ACCEPT 2>/dev/null
+    ip6tables -t filter -I INPUT -p tcp --dport $DOWNLOAD_PORT -j ACCEPT 2>/dev/null
+    
+    # 允许IPv6组播
+    ip6tables -t filter -I INPUT -p udp -d ff00::/8 -j ACCEPT 2>/dev/null
+    ip6tables -t filter -I OUTPUT -p udp -d ff00::/8 -j ACCEPT 2>/dev/null
+    ip6tables -t filter -I FORWARD -p udp -d ff00::/8 -j ACCEPT 2>/dev/null
+fi
+
+exit 0 

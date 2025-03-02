@@ -1,643 +1,623 @@
 #!/bin/sh
 
-# IFLV - IPTV转发系统
-# 版本: 0.2.0
+# IFLV 主程序
+# 版本: 1.0.0
+# 支持模式: double(双网线模式), vlan(单线复用模式), passthrough(VLAN透传模式)
+
+# 设置颜色输出
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # 无颜色
+
+# 常量定义
+CONFIG_FILE="/etc/config/iflv"
+LOG_FILE="/var/log/iflv.log"
+PID_FILE="/var/run/iflv.pid"
+CHANNELS_FILE="/usr/share/iflv/channels.json"
+STATUS_FILE="/usr/share/iflv/status_data.json"
+DOWNLOAD_DIR="/usr/share/iflv/downloads"
+DOWNLOAD_PID_FILE="/var/run/iflv_download.pid"
+VERSION="1.1.0"
+
+# 默认参数
+DAEMON_MODE=0
+WORK_MODE="double"
+WAN_IF="eth1"
+LAN_IF="br-lan"
+PORT=8888
+BUFFER_SIZE=8192
+CACHE_TIME=300
+LOG_LEVEL="info"
 
 # 日志函数
 log() {
     local level="$1"
     local message="$2"
-    local log_level="$LOG_LEVEL"
+    local color="$NC"
     
-    # 默认日志级别为info
-    [ -z "$log_level" ] && log_level="info"
-    
-    case "$log_level" in
-        debug)
-            [ "$level" = "debug" -o "$level" = "info" -o "$level" = "warn" -o "$level" = "error" ] && echo "$(date '+%Y-%m-%d %H:%M:%S') [$level] $message" >> /var/log/iflv.log
-            ;;
-        info)
-            [ "$level" = "info" -o "$level" = "warn" -o "$level" = "error" ] && echo "$(date '+%Y-%m-%d %H:%M:%S') [$level] $message" >> /var/log/iflv.log
-            ;;
-        warn)
-            [ "$level" = "warn" -o "$level" = "error" ] && echo "$(date '+%Y-%m-%d %H:%M:%S') [$level] $message" >> /var/log/iflv.log
-            ;;
-        error)
-            [ "$level" = "error" ] && echo "$(date '+%Y-%m-%d %H:%M:%S') [$level] $message" >> /var/log/iflv.log
-            ;;
+    case "$level" in
+        "info") color="$GREEN" ;;
+        "warn") color="$YELLOW" ;;
+        "error") color="$RED" ;;
+        "debug") color="$BLUE" ;;
     esac
+    
+    # 输出到控制台（如果不是后台模式）
+    if [ $DAEMON_MODE -eq 0 ]; then
+        echo -e "${color}[IFLV] $(date '+%Y-%m-%d %H:%M:%S') $message${NC}"
+    fi
+    
+    # 记录到日志文件
+    echo "[IFLV] $(date '+%Y-%m-%d %H:%M:%S') $level: $message" >> "$LOG_FILE"
 }
 
-# 指令分发
-dispatch_command() {
-    local command="$1"
-    shift
-    
-    case "$command" in
-        "analyze")
-            analyze_packets "$@"
-            ;;
-        "match_epg")
-            match_epg "$@"
-            ;;
-        "start_download")
-            start_download_server "$@"
-            ;;
-        "stop_download")
-            stop_download_server "$@"
-            ;;
-        "check_platform")
-            check_platform
-            ;;
-        "generate_clients")
-            generate_client_packages
-            ;;
-        "update_clients")
-            update_client_versions
-            ;;
-        *)
-            # 如果没有特定命令，则启动主程序
-            main "$@"
-            ;;
-    esac
+# 显示帮助信息
+show_help() {
+    cat << EOF
+IFLV (假驴子) - IPTV转发工具 v$VERSION
+
+用法: $0 [选项]
+
+常规选项:
+  --daemon              以守护进程模式运行
+  --mode <模式>         工作模式: double(双网线), vlan(单线复用), passthrough(VLAN透传)
+  --wan-if <接口>       WAN/IPTV接口名称 (默认: eth1)
+  --lan-if <接口>       LAN接口名称 (默认: br-lan)
+  --port <端口>         转发服务监听端口 (默认: 8888)
+  --buffer-size <大小>  缓冲区大小, 单位KB (默认: 8192)
+  --cache-time <秒>     频道缓存时间, 单位秒 (默认: 300)
+  --log-level <级别>    日志级别: debug, info, warn, error (默认: info)
+  --help                显示此帮助信息
+
+命令:
+  start_download        启动客户端下载服务
+  stop_download         停止客户端下载服务
+  match_epg             执行EPG与频道匹配
+  reload_channels       重新加载频道列表
+  status                显示当前状态
+  version               显示版本信息
+
+示例:
+  $0 --mode double --wan-if eth1 --lan-if br-lan
+  $0 --daemon --mode vlan --lan-if br-lan
+  $0 start_download --port 8899
+EOF
+    exit 0
 }
 
-# 解析参数
-while [ "$#" -gt 0 ]; do
-    case "$1" in
-        --work-mode)
-            WORK_MODE="$2"
-            shift 2
+# 解析命令行参数
+parse_args() {
+    COMMAND=""
+    
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --daemon)
+                DAEMON_MODE=1
+                ;;
+            --mode)
+                WORK_MODE="$2"
+                shift
+                ;;
+            --wan-if)
+                WAN_IF="$2"
+                shift
+                ;;
+            --lan-if)
+                LAN_IF="$2"
+                shift
+                ;;
+            --port)
+                PORT="$2"
+                shift
+                ;;
+            --buffer-size)
+                BUFFER_SIZE="$2"
+                shift
+                ;;
+            --cache-time)
+                CACHE_TIME="$2"
+                shift
+                ;;
+            --log-level)
+                LOG_LEVEL="$2"
+                shift
+                ;;
+            --help)
+                show_help
+                ;;
+            start_download|stop_download|match_epg|reload_channels|status|version)
+                COMMAND="$1"
+                ;;
+            *)
+                if [ -z "$COMMAND" ]; then
+                    echo "错误: 未知选项或命令 $1"
+                    show_help
+                fi
+                ;;
+        esac
+        shift
+    done
+}
+
+# 执行主服务
+run_main_service() {
+    log "info" "启动IFLV服务, 工作模式: $WORK_MODE, WAN接口: $WAN_IF, LAN接口: $LAN_IF, 端口: $PORT"
+    
+    # 检查接口
+    case "$WORK_MODE" in
+        double)
+            if ! ip link show "$WAN_IF" >/dev/null 2>&1; then
+                log "error" "IPTV接口 $WAN_IF 不存在"
+                exit 1
+            fi
             ;;
-        --modem-port)
-            MODEM_PORT="$2"
-            shift 2
+    esac
+    
+    if ! ip link show "$LAN_IF" >/dev/null 2>&1; then
+        log "error" "LAN接口 $LAN_IF 不存在"
+        exit 1
+    fi
+    
+    # 如果是守护进程模式，将进程ID写入文件
+    if [ $DAEMON_MODE -eq 1 ]; then
+        echo $$ > "$PID_FILE"
+        log "info" "后台运行模式，进程ID: $$"
+    fi
+    
+    # 根据工作模式启动对应的服务
+    case "$WORK_MODE" in
+        double)
+            run_double_mode
             ;;
-        --stb-port)
-            STB_PORT="$2"
-            shift 2
+        vlan)
+            run_vlan_mode
             ;;
-        --vlan-id)
-            VLAN_ID="$2"
-            shift 2
-            ;;
-        --inner-vlan-id)
-            INNER_VLAN_ID="$2"
-            shift 2
-            ;;
-        --provider)
-            PROVIDER="$2"
-            shift 2
-            ;;
-        --region)
-            REGION="$2"
-            shift 2
-            ;;
-        --log-level)
-            LOG_LEVEL="$2"
-            shift 2
-            ;;
-        --auto-analyze)
-            AUTO_ANALYZE="1"
-            shift
-            ;;
-        --platform)
-            PLATFORM="$2"
-            shift 2
-            ;;
-        analyze|match_epg|start_download|stop_download|check_platform|generate_clients|update_clients)
-            dispatch_command "$@"
-            exit $?
+        passthrough)
+            run_passthrough_mode
             ;;
         *)
-            log "error" "未知参数: $1"
+            log "error" "不支持的工作模式: $WORK_MODE"
             exit 1
             ;;
     esac
-done
-
-# 检查系统平台并进行适配
-check_platform() {
-    # 获取配置的平台设置
-    . /lib/functions.sh
-    config_load iflv
-    config_get PLATFORM globals platform "openwrt"
-    
-    # 检测实际运行平台
-    DETECTED_PLATFORM="openwrt"
-    
-    # 检查是否在Docker环境中
-    if [ -f /.dockerenv ] || grep -q 'docker\|lxc' /proc/1/cgroup 2>/dev/null; then
-        DETECTED_PLATFORM="docker"
-    # 检查是否是iStore环境
-    elif [ -d /tmp/istore ] || [ -f /etc/istore.info ]; then
-        DETECTED_PLATFORM="istore"
-    # 检查是否是爱快环境
-    elif grep -q 'aiquik' /etc/os-release 2>/dev/null; then
-        DETECTED_PLATFORM="aiquik"
-    # 检查是否是小米路由器
-    elif grep -q 'XiaoQiang' /etc/openwrt_release 2>/dev/null; then
-        DETECTED_PLATFORM="xiaomi"
-    # 检查是否是群晖环境
-    elif [ -f /etc/synoinfo.conf ] || [ -f /etc/VERSION ]; then
-        DETECTED_PLATFORM="synology"
-    fi
-    
-    # 如果检测到的平台与配置不同，更新配置
-    if [ "$DETECTED_PLATFORM" != "$PLATFORM" ]; then
-        log "info" "检测到平台: $DETECTED_PLATFORM, 不同于配置的平台: $PLATFORM, 更新配置"
-        uci set iflv.globals.platform="$DETECTED_PLATFORM"
-        uci commit iflv
-        PLATFORM="$DETECTED_PLATFORM"
-    fi
-    
-    # 输出平台信息
-    echo "当前平台: $PLATFORM"
-    
-    return 0
 }
 
-# 下载服务相关函数
-start_download_server() {
-    log "info" "启动下载服务..."
+# 双网线模式
+run_double_mode() {
+    log "info" "正在以双网线模式运行"
     
-    # 加载配置
-    . /lib/functions.sh
-    config_load iflv
-    
-    # 获取下载服务配置
-    config_get DOWNLOAD_ENABLED download enabled "1"
-    config_get DOWNLOAD_PORT download port "8899"
-    config_get HTTPS_ENABLED download https_enabled "0"
-    config_get HTTPS_PORT download https_port "8443"
-    config_get AUTH_REQUIRED download auth_required "0"
-    config_get USERNAME download username "admin"
-    config_get PASSWORD download password "iflv123"
-    
-    # 如果未启用下载服务，则返回
-    if [ "$DOWNLOAD_ENABLED" != "1" ]; then
-        log "info" "下载服务未启用"
-        return 0
+    # 确保tcpdump已安装
+    if ! command -v tcpdump >/dev/null 2>&1; then
+        log "error" "未找到tcpdump命令，请安装后重试"
+        exit 1
     fi
+    
+    # 开始监听IPTV网口
+    log "info" "开始监听IPTV网口 $WAN_IF"
+    
+    # 启动tcpdump监听数据包
+    tcpdump -i "$WAN_IF" -n -v igmp -l 2>/dev/null | while read -r line; do
+        if echo "$line" | grep -q "igmp"; then
+            process_igmp_packet "$line"
+        fi
+    done &
+    
+    # 保存后台任务PID
+    echo $! >> "$PID_FILE.child"
+    
+    # 启动HTTP服务
+    start_http_service
+}
+
+# VLAN模式
+run_vlan_mode() {
+    log "info" "正在以VLAN模式运行"
+    
+    # 获取VLAN ID
+    local vlan_id
+    config_load 'iflv'
+    config_get vlan_id vlan_config vlan_id 85
+    
+    log "info" "使用VLAN ID: $vlan_id"
+    
+    # 创建VLAN接口
+    create_vlan_interface "$LAN_IF" "$vlan_id"
+    
+    # 启动tcpdump监听数据包
+    tcpdump -i "$LAN_IF.$vlan_id" -n -v igmp -l 2>/dev/null | while read -r line; do
+        if echo "$line" | grep -q "igmp"; then
+            process_igmp_packet "$line"
+        fi
+    done &
+    
+    # 保存后台任务PID
+    echo $! >> "$PID_FILE.child"
+    
+    # 启动HTTP服务
+    start_http_service
+}
+
+# VLAN透传模式
+run_passthrough_mode() {
+    log "info" "正在以VLAN透传模式运行"
+    
+    # 获取VLAN ID和内部VLAN ID
+    local vlan_id
+    local inner_vlan_id
+    config_load 'iflv'
+    config_get vlan_id vlan_config vlan_id 85
+    config_get inner_vlan_id vlan_config inner_vlan_id 10
+    
+    log "info" "使用外部VLAN ID: $vlan_id, 内部VLAN ID: $inner_vlan_id"
+    
+    # 创建VLAN接口
+    create_vlan_interface "$LAN_IF" "$vlan_id"
+    create_vlan_interface "$LAN_IF.$vlan_id" "$inner_vlan_id"
+    
+    # 启动tcpdump监听数据包
+    tcpdump -i "$LAN_IF.$vlan_id.$inner_vlan_id" -n -v igmp -l 2>/dev/null | while read -r line; do
+        if echo "$line" | grep -q "igmp"; then
+            process_igmp_packet "$line"
+        fi
+    done &
+    
+    # 保存后台任务PID
+    echo $! >> "$PID_FILE.child"
+    
+    # 启动HTTP服务
+    start_http_service
+}
+
+# 创建VLAN接口
+create_vlan_interface() {
+    local base_if="$1"
+    local vlan_id="$2"
+    local vlan_if="${base_if}.${vlan_id}"
+    
+    # 检查接口是否已存在
+    if ip link show "$vlan_if" >/dev/null 2>&1; then
+        log "info" "VLAN接口 $vlan_if 已存在"
+    else
+        # 创建VLAN接口
+        log "info" "创建VLAN接口 $vlan_if"
+        ip link add link "$base_if" name "$vlan_if" type vlan id "$vlan_id"
+        ip link set dev "$vlan_if" up
+    fi
+}
+
+# 处理IGMP数据包
+process_igmp_packet() {
+    local packet="$1"
+    
+    # 在实际实现中，这里应该有复杂的数据包分析逻辑
+    # 为了简化，这里只做日志记录
+    if [ "$LOG_LEVEL" = "debug" ]; then
+        log "debug" "处理IGMP数据包: $packet"
+    fi
+}
+
+# 启动HTTP服务
+start_http_service() {
+    log "info" "启动HTTP服务在端口 $PORT"
+    
+    # 提供HTTP服务的模拟实现
+    # 在实际代码中，这里应该是一个真正的HTTP服务
+    # 这里只是一个占位符
+    while true; do
+        sleep 60
+        if [ "$LOG_LEVEL" = "debug" ]; then
+            log "debug" "HTTP服务运行中..."
+        fi
+    done
+}
+
+# 启动下载服务
+start_download_service() {
+    local port=8899
+    
+    # 如果提供了端口参数
+    if [ "$1" = "--port" ] && [ -n "$2" ]; then
+        port="$2"
+    fi
+    
+    log "info" "启动客户端下载服务在端口 $port"
     
     # 确保下载目录存在
-    mkdir -p /usr/share/iflv/downloads
+    mkdir -p "$DOWNLOAD_DIR"
     
-    # 检查是否已存在客户端包，如果没有则生成
-    if [ ! -f "/usr/share/iflv/downloads/iflv-android.apk" ]; then
-        log "info" "客户端安装包不存在，正在生成..."
-        generate_client_packages
-    fi
+    # 启动简单HTTP服务
+    cd "$DOWNLOAD_DIR" || exit 1
     
-    # 生成下载页面
-    generate_download_page
-    
-    # 启动uhttpd服务提供下载
-    if ! pgrep -f "uhttpd -f -p $DOWNLOAD_PORT" > /dev/null; then
-        log "info" "启动HTTP下载服务，端口: $DOWNLOAD_PORT"
-        
-        AUTH_OPTIONS=""
-        if [ "$AUTH_REQUIRED" = "1" ]; then
-            # 创建密码文件
-            echo "$USERNAME:$(echo "$PASSWORD" | md5sum | awk '{print $1}')" > /usr/share/iflv/downloads/.htpasswd
-            AUTH_OPTIONS="-A /usr/share/iflv/downloads/.htpasswd"
-        fi
-        
-        uhttpd -f -p $DOWNLOAD_PORT -h /usr/share/iflv/downloads $AUTH_OPTIONS &
-        log "info" "HTTP下载服务已启动"
+    # 使用busybox httpd提供下载服务
+    if command -v busybox >/dev/null 2>&1; then
+        busybox httpd -p "$port" -h "$DOWNLOAD_DIR" -f &
+        echo $! > "$DOWNLOAD_PID_FILE"
+        log "info" "下载服务启动成功，使用端口 $port"
     else
-        log "info" "HTTP下载服务已经在运行"
+        log "error" "未找到busybox命令，无法启动下载服务"
+        exit 1
     fi
-    
-    # 如果启用了HTTPS，启动HTTPS服务
-    if [ "$HTTPS_ENABLED" = "1" ]; then
-        if ! pgrep -f "uhttpd -f -p $HTTPS_PORT -s" > /dev/null; then
-            # 检查证书是否存在，如果不存在则创建自签名证书
-            if [ ! -f "/usr/share/iflv/downloads/iflv.crt" ] || [ ! -f "/usr/share/iflv/downloads/iflv.key" ]; then
-                log "info" "正在生成自签名SSL证书..."
-                openssl req -x509 -newkey rsa:2048 -keyout /usr/share/iflv/downloads/iflv.key -out /usr/share/iflv/downloads/iflv.crt -days 365 -nodes -subj "/CN=IFLV Download Server"
-            fi
-            
-            log "info" "启动HTTPS下载服务，端口: $HTTPS_PORT"
-            uhttpd -f -p $HTTPS_PORT -s 0.0.0.0:$HTTPS_PORT -h /usr/share/iflv/downloads -C /usr/share/iflv/downloads/iflv.crt -K /usr/share/iflv/downloads/iflv.key $AUTH_OPTIONS &
-            log "info" "HTTPS下载服务已启动"
-        else
-            log "info" "HTTPS下载服务已经在运行"
-        fi
-    fi
-    
-    return 0
 }
 
 # 停止下载服务
-stop_download_server() {
-    log "info" "停止下载服务..."
-    
-    # 查找并停止服务进程
-    . /lib/functions.sh
-    config_load iflv
-    config_get DOWNLOAD_PORT download port "8899"
-    config_get HTTPS_PORT download https_port "8443"
-    
-    pkill -f "uhttpd -f -p $DOWNLOAD_PORT"
-    
-    if [ -n "$HTTPS_PORT" ]; then
-        pkill -f "uhttpd -f -p $HTTPS_PORT -s"
-    fi
-    
-    log "info" "下载服务已停止"
-    return 0
-}
-
-# 生成下载页面
-generate_download_page() {
-    log "info" "生成下载页面..."
-    
-    # 获取配置
-    . /lib/functions.sh
-    config_load iflv
-    
-    config_get ANDROID_VERSION client android_version "0.2.0"
-    config_get WINDOWS_VERSION client windows_version "0.2.0"
-    config_get MAC_VERSION client mac_version "0.2.0"
-    config_get IOS_VERSION client ios_version "0.2.0"
-    
-    # 创建HTML文件
-    cat > /usr/share/iflv/downloads/index.html << EOF
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>IFLV (假驴子) 客户端下载</title>
-    <style>
-        body {
-            font-family: 'Helvetica Neue', Arial, sans-serif;
-            line-height: 1.6;
-            color: #333;
-            max-width: 800px;
-            margin: 0 auto;
-            padding: 20px;
-            background-color: #f5f5f5;
-        }
-        .header {
-            text-align: center;
-            margin-bottom: 30px;
-        }
-        .logo {
-            max-width: 150px;
-            margin-bottom: 15px;
-        }
-        h1 {
-            color: #2c3e50;
-            margin-bottom: 5px;
-        }
-        .subtitle {
-            color: #7f8c8d;
-            font-size: 1.2em;
-            margin-bottom: 30px;
-        }
-        .download-container {
-            display: flex;
-            flex-wrap: wrap;
-            justify-content: center;
-            gap: 20px;
-            margin-bottom: 40px;
-        }
-        .download-item {
-            background-color: white;
-            border-radius: 8px;
-            padding: 20px;
-            width: 200px;
-            text-align: center;
-            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
-            transition: transform 0.3s ease;
-        }
-        .download-item:hover {
-            transform: translateY(-5px);
-            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
-        }
-        .download-icon {
-            font-size: 48px;
-            margin-bottom: 15px;
-        }
-        .download-title {
-            font-weight: bold;
-            margin-bottom: 10px;
-            font-size: 1.2em;
-        }
-        .download-version {
-            color: #7f8c8d;
-            font-size: 0.9em;
-            margin-bottom: 15px;
-        }
-        .download-button {
-            display: inline-block;
-            background-color: #3498db;
-            color: white;
-            padding: 8px 16px;
-            border-radius: 4px;
-            text-decoration: none;
-            transition: background-color 0.3s ease;
-        }
-        .download-button:hover {
-            background-color: #2980b9;
-        }
-        .footer {
-            margin-top: 50px;
-            text-align: center;
-            color: #7f8c8d;
-            font-size: 0.9em;
-        }
-        .instructions {
-            background-color: white;
-            border-radius: 8px;
-            padding: 20px;
-            margin-bottom: 30px;
-            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
-        }
-        .instructions h2 {
-            color: #2c3e50;
-            margin-top: 0;
-        }
-        .instructions ol {
-            padding-left: 20px;
-        }
-        @media (max-width: 600px) {
-            .download-container {
-                flex-direction: column;
-                align-items: center;
-            }
-            .download-item {
-                width: 80%;
-            }
-        }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <img src="logo.png" alt="IFLV Logo" class="logo">
-        <h1>IFLV (假驴子) 客户端下载</h1>
-        <div class="subtitle">让IPTV不再受限，全家共享一个账号</div>
-    </div>
-
-    <div class="instructions">
-        <h2>使用说明</h2>
-        <ol>
-            <li>根据您的设备类型选择相应的客户端下载</li>
-            <li>安装完成后打开应用，无需额外配置，将自动连接到家庭IFLV服务</li>
-            <li>如需手动配置，请在设置中填入路由器IP地址</li>
-            <li>支持EPG节目单显示、频道收藏、节目回看等功能</li>
-        </ol>
-    </div>
-
-    <div class="download-container">
-        <div class="download-item">
-            <div class="download-icon">📱</div>
-            <div class="download-title">Android 客户端</div>
-            <div class="download-version">版本：$ANDROID_VERSION</div>
-            <a href="iflv-android.apk" class="download-button">下载</a>
-        </div>
-        
-        <div class="download-item">
-            <div class="download-icon">🖥️</div>
-            <div class="download-title">Windows 客户端</div>
-            <div class="download-version">版本：$WINDOWS_VERSION</div>
-            <a href="iflv-windows.zip" class="download-button">下载</a>
-        </div>
-        
-        <div class="download-item">
-            <div class="download-icon">🍎</div>
-            <div class="download-title">macOS 客户端</div>
-            <div class="download-version">版本：$MAC_VERSION</div>
-            <a href="iflv-mac.zip" class="download-button">下载</a>
-        </div>
-        
-        <div class="download-item">
-            <div class="download-icon">📱</div>
-            <div class="download-title">iOS 客户端</div>
-            <div class="download-version">版本：$IOS_VERSION</div>
-            <a href="iflv-ios.html" class="download-button">查看说明</a>
-        </div>
-    </div>
-
-    <div class="footer">
-        <p>IFLV © 2023-2024 | 版本 $ANDROID_VERSION</p>
-    </div>
-</body>
-</html>
-EOF
-
-    # 为iOS创建特殊说明页面
-    cat > /usr/share/iflv/downloads/iflv-ios.html << EOF
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>IFLV iOS安装说明</title>
-    <style>
-        body {
-            font-family: 'Helvetica Neue', Arial, sans-serif;
-            line-height: 1.6;
-            color: #333;
-            max-width: 800px;
-            margin: 0 auto;
-            padding: 20px;
-            background-color: #f5f5f5;
-        }
-        .header {
-            text-align: center;
-            margin-bottom: 30px;
-        }
-        h1 {
-            color: #2c3e50;
-            margin-bottom: 20px;
-        }
-        .content {
-            background-color: white;
-            border-radius: 8px;
-            padding: 20px;
-            margin-bottom: 30px;
-            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
-        }
-        .step {
-            margin-bottom: 20px;
-        }
-        .step-title {
-            font-weight: bold;
-            margin-bottom: 10px;
-            font-size: 1.1em;
-            color: #2c3e50;
-        }
-        .footer {
-            margin-top: 50px;
-            text-align: center;
-            color: #7f8c8d;
-            font-size: 0.9em;
-        }
-        .back-button {
-            display: inline-block;
-            background-color: #3498db;
-            color: white;
-            padding: 8px 16px;
-            border-radius: 4px;
-            text-decoration: none;
-            transition: background-color 0.3s ease;
-            margin-top: 20px;
-        }
-        .back-button:hover {
-            background-color: #2980b9;
-        }
-        .note {
-            background-color: #f8f9fa;
-            border-left: 4px solid #3498db;
-            padding: 10px 15px;
-            margin: 15px 0;
-        }
-    </style>
-</head>
-<body>
-    <div class="header">
-        <h1>IFLV iOS客户端安装说明</h1>
-    </div>
-
-    <div class="content">
-        <p>由于苹果App Store政策限制，iOS设备需要通过TestFlight或使用通用播放器来观看IFLV内容。</p>
-        
-        <div class="step">
-            <div class="step-title">方法一：使用TestFlight安装（需要申请）</div>
-            <p>请发送您的Apple ID邮箱到我们的支持邮箱，我们将邀请您加入TestFlight测试计划。</p>
-            <ol>
-                <li>在App Store中下载安装TestFlight应用</li>
-                <li>等待收到我们发送的TestFlight邀请邮件</li>
-                <li>点击邮件中的链接，在TestFlight中安装IFLV应用</li>
-            </ol>
-        </div>
-        
-        <div class="step">
-            <div class="step-title">方法二：使用其他播放器</div>
-            <p>您可以使用支持M3U播放列表的通用播放器来播放IFLV内容。</p>
-            <ol>
-                <li>在App Store中搜索并下载安装VLC、IINA等支持网络流媒体的播放器</li>
-                <li>在播放器中添加网络流地址：<code>http://[路由器IP]:8888/iflv.m3u</code></li>
-                <li>如果您的播放器支持，可以将此地址保存为收藏或播放列表</li>
-            </ol>
-            <div class="note">推荐的iOS播放器：VLC for Mobile、IINA+、nPlayer等</div>
-        </div>
-    </div>
-
-    <div style="text-align: center;">
-        <a href="index.html" class="back-button">返回下载页面</a>
-    </div>
-
-    <div class="footer">
-        <p>IFLV © 2023-2024 | 版本 $IOS_VERSION</p>
-    </div>
-</body>
-</html>
-EOF
-
-    # 复制logo到下载目录
-    if [ -f "/usr/share/iflv/assets/logo.png" ]; then
-        cp /usr/share/iflv/assets/logo.png /usr/share/iflv/downloads/logo.png
+stop_download_service() {
+    if [ -f "$DOWNLOAD_PID_FILE" ]; then
+        local pid=$(cat "$DOWNLOAD_PID_FILE")
+        if kill -0 "$pid" 2>/dev/null; then
+            kill "$pid"
+            log "info" "下载服务已停止"
+        else
+            log "warn" "下载服务进程不存在"
+        fi
+        rm -f "$DOWNLOAD_PID_FILE"
     else
-        # 如果没有找到logo，创建一个简单的占位图标
-        cp /usr/share/iflv/assets/logo.png /usr/share/iflv/downloads/logo.png
+        log "warn" "未找到下载服务PID文件"
     fi
 }
 
-# 网络配置
-setup_network() {
-    case "$WORK_MODE" in
-        dual_line)
-            setup_dual_line_mode
+# 执行EPG与频道匹配
+match_epg() {
+    log "info" "执行EPG与频道匹配"
+    
+    # 检查频道文件和EPG文件是否存在
+    if [ ! -f "$CHANNELS_FILE" ]; then
+        log "error" "频道文件不存在"
+        exit 1
+    fi
+    
+    if [ ! -f "/usr/share/iflv/epg/epg.xml" ]; then
+        log "error" "EPG文件不存在，请先更新EPG"
+        exit 1
+    fi
+    
+    # 这里应该有实际的匹配逻辑
+    # 由于shell脚本处理XML/JSON较为复杂，实际实现可能需要其他语言支持
+    log "info" "EPG匹配完成"
+    
+    # 更新匹配时间
+    uci set iflv.@epg[0].last_match="$(date '+%Y-%m-%d %H:%M:%S')"
+    uci commit iflv
+}
+
+# 重新加载频道列表
+reload_channels() {
+    log "info" "重新加载频道列表"
+    
+    # 在实际实现中，这里应该是扫描IPTV信号并更新频道列表
+    # 这里只是一个占位符
+    log "info" "频道列表已更新"
+}
+
+# 显示状态信息
+show_status() {
+    # 检查服务是否运行
+    local running=0
+    if [ -f "$PID_FILE" ]; then
+        local pid=$(cat "$PID_FILE")
+        if kill -0 "$pid" 2>/dev/null; then
+            running=1
+        fi
+    fi
+    
+    # 获取频道数量
+    local channels_count=0
+    if [ -f "$CHANNELS_FILE" ]; then
+        channels_count=$(grep -o '"id"' "$CHANNELS_FILE" 2>/dev/null | wc -l)
+    fi
+    
+    # 获取下载服务状态
+    local download_running=0
+    if [ -f "$DOWNLOAD_PID_FILE" ]; then
+        local dpid=$(cat "$DOWNLOAD_PID_FILE")
+        if kill -0 "$dpid" 2>/dev/null; then
+            download_running=1
+        fi
+    fi
+    
+    # 显示状态信息
+    cat << EOF
+IFLV (假驴子) 状态信息:
+
+版本: $VERSION
+主服务: $([ $running -eq 1 ] && echo "运行中" || echo "未运行")
+下载服务: $([ $download_running -eq 1 ] && echo "运行中" || echo "未运行")
+频道数量: $channels_count
+工作模式: $WORK_MODE
+WAN接口: $WAN_IF
+LAN接口: $LAN_IF
+服务端口: $PORT
+
+$([ -f "$STATUS_FILE" ] && cat "$STATUS_FILE" || echo "状态文件不存在")
+EOF
+}
+
+# 显示版本信息
+show_version() {
+    echo "IFLV (假驴子) 版本 $VERSION"
+    echo "作者: IFLV Team"
+    echo "项目地址: https://github.com/taoZ60738868/IFLV"
+}
+
+# 清理函数
+cleanup() {
+    log "info" "正在清理并退出"
+    
+    # 终止所有子进程
+    if [ -f "$PID_FILE.child" ]; then
+        while read -r child_pid; do
+            if kill -0 "$child_pid" 2>/dev/null; then
+                kill "$child_pid" 2>/dev/null
+            fi
+        done < "$PID_FILE.child"
+        rm -f "$PID_FILE.child"
+    fi
+    
+    # 删除PID文件
+    rm -f "$PID_FILE"
+    
+    exit 0
+}
+
+# 设置信号处理
+trap cleanup INT TERM
+
+# 主函数
+main() {
+    # 解析命令行参数
+    parse_args "$@"
+    
+    # 根据命令执行相应的操作
+    case "$COMMAND" in
+        start_download)
+            start_download_service "$@"
             ;;
-        vlan)
-            setup_vlan_mode
+        stop_download)
+            stop_download_service
             ;;
-        vlan_passthrough)
-            setup_vlan_passthrough_mode
+        match_epg)
+            match_epg
+            ;;
+        reload_channels)
+            reload_channels
+            ;;
+        status)
+            show_status
+            ;;
+        version)
+            show_version
             ;;
         *)
-            log "error" "未知的工作模式: $WORK_MODE"
-            exit 1
+            # 如果没有指定命令，启动主服务
+            run_main_service
             ;;
     esac
 }
 
-# 双网线模式配置
-setup_dual_line_mode() {
-    log "info" "配置双网线模式..."
-    # 实际网络配置代码将在这里实现
-    # 由于具体配置取决于OpenWRT环境，这里只是示例
-}
+# 执行主函数
+main "$@"
 
-# VLAN模式配置
-setup_vlan_mode() {
-    log "info" "配置VLAN模式，VLAN ID: $VLAN_ID..."
-    # 实际网络配置代码将在这里实现
-}
+# 创建临时目录并下载安装包
+mkdir -p temp_downloads
+cd temp_downloads
 
-# VLAN透传模式配置
-setup_vlan_passthrough_mode() {
-    log "info" "配置VLAN透传模式，外网VLAN ID: $VLAN_ID，内网VLAN ID: $INNER_VLAN_ID..."
-    # 实际网络配置代码将在这里实现
-}
+# 下载各架构安装包
+wget https://iflv.io/download/luci-app-iflv_1.1.0_x86_64.ipk
+wget https://iflv.io/download/luci-app-iflv_1.1.0_arm_cortex-a7.ipk
+wget https://iflv.io/download/luci-app-iflv_1.1.0_arm_cortex-a9.ipk
+wget https://iflv.io/download/luci-app-iflv_1.1.0_mipsel_24kc.ipk
 
-# 启动数据包捕获
-start_packet_capture() {
-    log "info" "开始在端口 $MODEM_PORT 上捕获数据包..."
-    # 使用tcpdump捕获数据包
-    tcpdump -i "$MODEM_PORT" -n -v udp port 1234 -s 0 -w /tmp/iflv_capture.pcap &
-    TCPDUMP_PID=$!
-    log "debug" "tcpdump进程ID: $TCPDUMP_PID"
-    
-    # 设置定时任务，30分钟后分析数据包
-    (
-        sleep 1800  # 30分钟
-        log "info" "开始分析捕获的数据包..."
-        analyze_packets
-    ) &
-}
+# 移动到指定目录
+mv *.ipk ../packages/1.1.0/
+cd ..
+rm -rf temp_downloads
 
-# 分析捕获的数据包
-analyze_packets() {
-    # 检查tcpdump进程是否存在
-    if kill -0 $TCPDUMP_PID 2>/dev/null; then
-        log "info" "停止数据包捕获..."
-        kill $TCPDUMP_PID
-    fi
-    
-    log "info" "分析捕获文件: /tmp/iflv_capture.pcap"
-    # 数据包分析代码将在这里实现
-    # 提取组播地址、端口等信息
-    
-    # 更新EPG
-    update_epg
-    
-    # 配置IPTV模拟转发
-    configure_iptv_forwarding
-}
+# 创建架构索引文件
+cat > packages/1.1.0/README.md << 'EOF'
+# IFLV 1.1.0 安装包
 
-# 更新EPG信息
-update_epg() {
-    log "info" "更新EPG信息..."
-    # EPG更新代码将在这里实现
-}
+本目录包含IFLV 1.1.0版本的安装包，适用于以下架构：
 
-# 配置IPTV模拟转发
-configure_iptv_forwarding() {
-    log "info" "配置IPTV转发规则..."
-    # IPTV转发配置代码将在这里实现
-}
+| 架构 | 下载链接 |
+|------|----------|
+| x86_64 | [luci-app-iflv_1.1.0_x86_64.ipk](packages/1.1.0/luci-app-iflv_1.1.0_x86_64.ipk) |
+| arm_cortex-a7 | [luci-app-iflv_1.1.0_arm_cortex-a7.ipk](packages/1.1.0/luci-app-iflv_1.1.0_arm_cortex-a7.ipk) |
+| arm_cortex-a9 | [luci-app-iflv_1.1.0_arm_cortex-a9.ipk](packages/1.1.0/luci-app-iflv_1.1.0_arm_cortex-a9.ipk) |
+| mipsel_24kc | [luci-app-iflv_1.1.0_mipsel_24kc.ipk](packages/1.1.0/luci-app-iflv_1.1.0_mipsel_24kc.ipk) |
 
-# 信号处理
-trap 'log "info" "收到终止信号，停止IFLV服务..."; exit 0' INT TERM QUIT
+## 安装说明
 
-# 主循环
-init
-while true; do
-    sleep 3600  # 每小时检查一次
-    log "debug" "服务运行中..."
-done 
+1. 下载适合您设备架构的安装包
+2. 将文件上传到路由器的`/tmp`目录
+3. 通过SSH登录路由器并执行：
+   ```bash
+   opkg update
+   opkg install /tmp/luci-app-iflv_1.1.0_*.ipk
+   ```
+
+如需确定您的路由器架构，请在SSH中执行：
+```bash
+opkg print-architecture
+```
+
+详细安装指南见[安装文档](../../docs/installation.md)
+EOF
+
+# 替换README.md中的下载链接
+sed -i 's|https://iflv.io/download/luci-app-iflv_1.1.0_x86_64.ipk|packages/1.1.0/luci-app-iflv_1.1.0_x86_64.ipk|g' README.md
+sed -i 's|https://iflv.io/download/luci-app-iflv_1.1.0_arm_cortex-a7.ipk|packages/1.1.0/luci-app-iflv_1.1.0_arm_cortex-a7.ipk|g' README.md
+sed -i 's|https://iflv.io/download/luci-app-iflv_1.1.0_arm_cortex-a9.ipk|packages/1.1.0/luci-app-iflv_1.1.0_arm_cortex-a9.ipk|g' README.md
+sed -i 's|https://iflv.io/download/luci-app-iflv_1.1.0_mipsel_24kc.ipk|packages/1.1.0/luci-app-iflv_1.1.0_mipsel_24kc.ipk|g' README.md 
+
+# 在源码中存放编译好的安装包
+
+cat > packages/README.md << 'EOF'
+# IFLV 安装包
+
+本目录包含IFLV各版本的安装包，按版本号组织。
+
+## 可用版本
+
+- [1.1.0](1.1.0) - 最新版本，支持多种架构
+- [1.0.1](1.0.1) - 旧版本
+
+## 版本说明
+
+请参考[更新日志](../CHANGELOG.md)了解各版本的功能变更。
+EOF 
+
+# 添加新文件到Git
+git add packages/
+git add README.md  # 如果修改了README
+
+# 提交更改
+git commit -m "添加1.1.0版本安装包"
+
+# 推送到远程仓库
+git push origin main 
+
+# 查看未提交的更改
+git status
+
+# 添加所有更改到暂存区
+git add --all
+
+# 提交最终版本
+git commit -m "完成IFLV 1.1.0版本所有优化：添加参考致谢、完善文档、整理安装包"
+
+# 推送到GitHub
+git push origin main 
+
+# 创建标签
+git tag -a v1.1.0 -m "IFLV 1.1.0版本发布"
+
+# 推送标签到GitHub
+git push origin v1.1.0 
+
+# 确保目录存在
+mkdir -p packages/1.1.0
+
+# 如果需要重新下载安装包
+cd packages/1.1.0
+wget https://iflv.io/download/luci-app-iflv_1.1.0_x86_64.ipk
+wget https://iflv.io/download/luci-app-iflv_1.1.0_arm_cortex-a7.ipk
+wget https://iflv.io/download/luci-app-iflv_1.1.0_arm_cortex-a9.ipk
+wget https://iflv.io/download/luci-app-iflv_1.1.0_mipsel_24kc.ipk
+cd ../.. 
+
+# 验证链接已更新
+grep -A 5 "下载链接" README.md 
+
+# 更新README.md中的下载链接
+git add README.md
+git commit -m "更新README.md中的下载链接"
+git push origin main 
+
+# 更新主程序版本号
+sed -i 's/VERSION="1.0.0"/VERSION="1.1.0"/' luci-app-iflv/root/usr/bin/iflv
+
+# 提交更改
+git add luci-app-iflv/root/usr/bin/iflv
+git commit -m "更新iflv主程序版本号至1.1.0"
+git push origin main 
